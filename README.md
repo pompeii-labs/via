@@ -50,7 +50,7 @@ Give automation a narrower control surface than SSH:
 ```bash
 via exec rig -- docker ps
 via deploy nginx:latest --to rig --name preview --port 18081:80
-via logs preview --limit 100
+via logs preview
 via rm preview
 ```
 
@@ -224,7 +224,6 @@ Updating installs the new binary. Restart running daemons after updating so long
 | `via node ping rig` | Check one node daemon. |
 | `via exec rig -- <cmd>` | Run a command on a node through Via RPC. |
 | `via deploy <image> --to rig --name web` | Deploy a Docker image. |
-| `via deploy <path> --to rig --name app` | Deploy a local path to a node via Docker build. |
 | `via ps` | Show services with live container status. |
 | `via services` | Show recorded service state. |
 | `via logs web` | Read service logs. |
@@ -277,6 +276,12 @@ cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo llvm-cov --summary-only
+```
+
+With `just`:
+
+```bash
+just check
 ```
 
 Build a local release binary:
@@ -332,6 +337,10 @@ Via is a Rust binary crate. It embeds Lux for local state and uses Docker for co
 
 Important modules:
 
+- `AGENTS.md`: operator guide for humans and automation.
+- `CONTRIBUTING.md`: contribution workflow.
+- `SECURITY.md`: private vulnerability reporting policy.
+- `Justfile`: local development command shortcuts.
 - `src/cli.rs`: CLI command definitions.
 - `src/main.rs`: command handlers.
 - `src/ssh.rs`: SSH bootstrap and path deploy transfer helpers.

@@ -135,7 +135,7 @@ pub fn local_container_status(container: &str) -> Result<String> {
 pub fn local_logs(container: &str, follow: bool) -> Result<String> {
     if follow {
         return Err(anyhow!(
-            "remote follow logs are not implemented yet; omit --follow"
+            "remote follow logs are not supported; omit --follow"
         ));
     }
     let output = Command::new("docker")

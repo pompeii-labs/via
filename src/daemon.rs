@@ -2,7 +2,7 @@ use crate::docker;
 use crate::paths::ViaPaths;
 use crate::rpc::{RpcRequest, RpcResponse};
 use crate::state::ViaState;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::HashSet;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -101,9 +101,6 @@ async fn handle_request(state: &mut ViaState, request: RpcRequest) -> Result<Rpc
             state.append_event("service.started", &service).await?;
             state.persist().await?;
             Ok(RpcResponse::Service { service })
-        }
-        RpcRequest::DeployPath { .. } => {
-            bail!("path deploy over daemon RPC is not implemented yet; use a Docker image for now")
         }
         RpcRequest::Logs { container, follow } => Ok(RpcResponse::Logs {
             output: docker::local_logs(&container, follow)?,

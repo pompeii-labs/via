@@ -461,22 +461,7 @@ mod commands {
             if node.last_seen_at.is_some() {
                 docker::deploy_path(&node, &target_path, &container, port, &env, &command).await?
             } else {
-                match crate::rpc::call(
-                    &node.daemon_addr,
-                    crate::rpc::RpcRequest::DeployPath {
-                        path: target,
-                        service: service_name.clone(),
-                        container,
-                        port,
-                        env,
-                        command,
-                    },
-                )
-                .await?
-                {
-                    crate::rpc::RpcResponse::Service { service } => service,
-                    other => bail!("unexpected deploy response: {other:?}"),
-                }
+                bail!("remote path deploy is not supported in v0.1.0; build and push an image, then deploy the image")
             }
         } else if node.last_seen_at.is_some() {
             docker::deploy_image(&node, &target, &container, port, &env, &command).await?
@@ -578,7 +563,7 @@ mod commands {
     ) -> Result<()> {
         let Some(service) = service else {
             if follow {
-                bail!("system log follow is not implemented yet");
+                bail!("system log follow is not supported; omit --follow");
             }
             let events = state.events(limit).await?;
             if events.is_empty() {
@@ -739,7 +724,7 @@ mod commands {
         }
 
         let latest = match version {
-            Some(version) => version.trim_start_matches('v').to_string(),
+            Some(version) => normalize_release_version(&version)?,
             None => latest_release_version()?,
         };
 
@@ -848,7 +833,7 @@ mod commands {
 
     fn latest_release_version() -> Result<String> {
         if let Ok(version) = std::env::var("VIA_UPDATE_VERSION") {
-            return Ok(version.trim_start_matches('v').to_string());
+            return normalize_release_version(&version);
         }
         let repo = std::env::var("VIA_UPDATE_REPO").unwrap_or_else(|_| UPDATE_REPO.to_string());
         let url = format!("https://api.github.com/repos/{repo}/releases/latest");
@@ -890,6 +875,18 @@ mod commands {
             .get("tag_name")?
             .as_str()
             .map(|tag| tag.trim_start_matches('v').to_string())
+    }
+
+    fn normalize_release_version(version: &str) -> Result<String> {
+        let version = version.trim().trim_start_matches('v');
+        if version.is_empty()
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            bail!("invalid Via release version '{version}'");
+        }
+        Ok(version.to_string())
     }
 
     fn version_newer(latest: &str, current: &str) -> bool {
@@ -1073,7 +1070,10 @@ mod commands {
 
     #[cfg(test)]
     mod tests {
-        use super::{parse_latest_release_version, update_shell_command, version_newer};
+        use super::{
+            normalize_release_version, parse_latest_release_version, update_shell_command,
+            version_newer,
+        };
 
         #[test]
         fn parses_latest_release_version() {
@@ -1095,6 +1095,17 @@ mod commands {
             assert!(command.contains("bash -s -- 0.1.0"));
             assert!(command.contains("curl"));
             assert!(command.contains("wget"));
+        }
+
+        #[test]
+        fn release_versions_are_shell_safe() {
+            assert_eq!(normalize_release_version("v0.1.0").unwrap(), "0.1.0");
+            assert_eq!(
+                normalize_release_version("0.1.0-rc.1").unwrap(),
+                "0.1.0-rc.1"
+            );
+            assert!(normalize_release_version("0.1.0; echo no").is_err());
+            assert!(normalize_release_version("").is_err());
         }
     }
 }

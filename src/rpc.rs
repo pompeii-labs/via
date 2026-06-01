@@ -23,14 +23,6 @@ pub enum RpcRequest {
         env: Vec<(String, String)>,
         command: Vec<String>,
     },
-    DeployPath {
-        path: String,
-        service: String,
-        container: String,
-        port: Option<String>,
-        env: Vec<(String, String)>,
-        command: Vec<String>,
-    },
     ContainerStatus {
         container: String,
     },

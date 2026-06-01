@@ -116,6 +116,9 @@ cargo build --locked --release
 ## Important Files
 
 - `README.md`: user-facing docs.
+- `CONTRIBUTING.md`: contribution workflow.
+- `SECURITY.md`: vulnerability reporting policy.
+- `Justfile`: local command shortcuts.
 - `install.sh`: public binary installer.
 - `.github/workflows/ci.yml`: PR checks.
 - `.github/workflows/release.yml`: tag release deploy.
