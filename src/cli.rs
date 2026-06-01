@@ -70,7 +70,7 @@ pub enum Command {
         service: String,
     },
     Exec {
-        service: String,
+        node: String,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },

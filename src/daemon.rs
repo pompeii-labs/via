@@ -219,8 +219,8 @@ async fn handle_request(state: &mut ViaState, request: RpcRequest) -> Result<Rpc
         RpcRequest::ContainerStatus { container } => Ok(RpcResponse::ContainerStatus {
             status: docker::local_container_status(&container)?,
         }),
-        RpcRequest::Exec { container, command } => Ok(RpcResponse::Exec {
-            output: docker::local_exec(&container, &command)?,
+        RpcRequest::Exec { command } => Ok(RpcResponse::Exec {
+            output: crate::util::run_command_capture(&command)?,
         }),
         RpcRequest::Stop { container } => {
             docker::local_stop(&container)?;

@@ -132,25 +132,6 @@ pub fn local_container_status(container: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub fn local_exec(container: &str, command: &[String]) -> Result<String> {
-    if command.is_empty() {
-        bail!("exec command cannot be empty");
-    }
-    let output = Command::new("docker")
-        .arg("exec")
-        .arg(container)
-        .args(command)
-        .output()
-        .with_context(|| format!("failed to exec in {container}"))?;
-    let mut combined = String::new();
-    combined.push_str(&String::from_utf8_lossy(&output.stdout));
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
-        bail!("docker exec failed: {combined}");
-    }
-    Ok(combined)
-}
-
 pub fn local_logs(container: &str, follow: bool) -> Result<String> {
     if follow {
         return Err(anyhow!(

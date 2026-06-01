@@ -406,6 +406,14 @@ fn sanitized_event(event: &Event) -> Event {
             return event;
         }
     }
+    if event.kind == "node.exec" {
+        if let Some(mut payload) = event.payload.as_object().cloned() {
+            payload.remove("command");
+            let mut event = event.clone();
+            event.payload = serde_json::Value::Object(payload);
+            return event;
+        }
+    }
     event.clone()
 }
 

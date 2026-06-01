@@ -39,7 +39,6 @@ pub enum RpcRequest {
         follow: bool,
     },
     Exec {
-        container: String,
         command: Vec<String>,
     },
     Stop {

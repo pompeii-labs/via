@@ -1,4 +1,5 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime, UtcOffset};
 
@@ -60,9 +61,26 @@ pub fn normalize_slug(input: &str) -> Result<String> {
     Ok(out)
 }
 
+pub fn run_command_capture(command: &[String]) -> Result<String> {
+    if command.is_empty() {
+        bail!("exec command cannot be empty");
+    }
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .output()
+        .with_context(|| format!("failed to run {}", command[0]))?;
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        bail!("command failed: {combined}");
+    }
+    Ok(combined)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_ts, normalize_slug};
+    use super::{format_ts, normalize_slug, run_command_capture};
 
     #[test]
     fn normalizes_hostnames() {
@@ -82,5 +100,16 @@ mod tests {
         let formatted = format_ts(0);
         assert_ne!(formatted, "0");
         assert!(formatted.contains(':'));
+    }
+
+    #[test]
+    fn captures_command_output() {
+        let output = run_command_capture(&[
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf via-node-exec".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(output, "via-node-exec");
     }
 }

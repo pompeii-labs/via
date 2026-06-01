@@ -30,11 +30,17 @@ Operate services:
 
 ```bash
 via logs web
-via exec web -- printenv
 via stop web
 via restart web
 via rm web
 via open web
+```
+
+Run commands on nodes over Via's encrypted RPC channel:
+
+```bash
+via exec rig -- uptime
+via exec rig -- sh -lc 'docker ps && df -h'
 ```
 
 Manage secrets:

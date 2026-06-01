@@ -97,8 +97,8 @@ async fn main() -> Result<()> {
         Command::Rm { service } => {
             commands::rm(&mut state, service).await?;
         }
-        Command::Exec { service, command } => {
-            commands::exec(&state, service, command).await?;
+        Command::Exec { node, command } => {
+            commands::exec(&mut state, node, command).await?;
         }
         Command::Open { service } => {
             commands::open(&state, service).await?;
@@ -661,21 +661,19 @@ mod commands {
         Ok(())
     }
 
-    pub async fn exec(state: &ViaState, service: String, command: Vec<String>) -> Result<()> {
-        let service = state
-            .service_by_name(&service)
+    pub async fn exec(state: &mut ViaState, node: String, command: Vec<String>) -> Result<()> {
+        let node = state
+            .node_by_slug(&node)
             .await?
-            .ok_or_else(|| anyhow!("unknown service"))?;
-        let local = state.local_node().await?.id == service.node_id;
-        let service = resolve_service_node_addr(state, service).await?;
+            .ok_or_else(|| anyhow!("unknown node '{node}'"))?;
+        let local = state.local_node().await?.id == node.id;
         let output = if local {
-            docker::local_exec(&service.container, &command)?
+            crate::util::run_command_capture(&command)?
         } else {
             match crate::rpc::call(
-                &service.node_addr,
+                &node.daemon_addr,
                 crate::rpc::RpcRequest::Exec {
-                    container: service.container.clone(),
-                    command,
+                    command: command.clone(),
                 },
             )
             .await?
@@ -684,6 +682,18 @@ mod commands {
                 other => bail!("unexpected exec response: {other:?}"),
             }
         };
+        state
+            .append_event(
+                "node.exec",
+                &serde_json::json!({
+                    "node": node.slug,
+                    "argc": command.len(),
+                    "local": local
+                }),
+            )
+            .await?;
+        state.persist().await?;
+        sync_all(state).await?;
         print!("{output}");
         Ok(())
     }
