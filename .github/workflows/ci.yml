@@ -1,13 +1,13 @@
-name: ci
+name: Checks
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches:
+      - main
 
 jobs:
-  test:
-    name: fmt, test, build
+  format:
+    name: formatting
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -28,21 +28,74 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  test:
+    name: tests
+    needs: format
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Pompeii/via
+    steps:
+      - name: Checkout Via
+        uses: actions/checkout@v4
+        with:
+          path: Pompeii/via
+
+      - name: Checkout Lux
+        uses: actions/checkout@v4
+        with:
+          repository: lux-db/lux
+          ref: v0.13.2
+          path: Lux/lux
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: Pompeii/via
 
-      - name: Check formatting
-        run: cargo fmt -- --check
-
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --locked --all-targets
+
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Pompeii/via
+    steps:
+      - name: Checkout Via
+        uses: actions/checkout@v4
+        with:
+          path: Pompeii/via
+
+      - name: Checkout Lux
+        uses: actions/checkout@v4
+        with:
+          repository: lux-db/lux
+          ref: v0.13.2
+          path: Lux/lux
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Pompeii/via
 
       - name: Build
         run: cargo build --locked --release
