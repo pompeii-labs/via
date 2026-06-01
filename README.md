@@ -4,56 +4,92 @@
   <img src="assets/via-logo-512.png" alt="Via logo" width="180">
 </p>
 
-Via is a private mesh control plane for machines you own.
+Via is a private control plane for machines you own.
 
-It lets a laptop, desktop rig, Mac mini, Raspberry Pi, or server join one small trusted mesh so you can deploy containers, inspect services, run commands, read logs, and sync encrypted state without giving every tool SSH keys or raw Docker socket access.
+It joins laptops, desktops, Raspberry Pis, Mac minis, and servers into one trusted mesh. From any node, you can inspect the mesh, run commands on another node, deploy containers, read logs, manage secrets, and update Via without handing every tool SSH keys or raw Docker access.
 
-Via is intentionally CLI-first. No hosted dashboard, no website, no account system.
+Via is CLI-first. There is no hosted account, dashboard, or website requirement.
 
-## Why
+## Use Cases
 
-Homelab and local infrastructure workflows usually collapse into a pile of SSH aliases, shell scripts, copied `.env` files, and one-off Docker commands.
-
-Via is trying to make that feel like one coherent machine:
+Run homelab services from one machine:
 
 ```bash
-via ps
-via exec rig -- uptime
 via deploy nginx:latest --to rig --name web --port 18080:80
+via ps
 via logs web
+via open web
 ```
 
-The long-term direction is an agent-safe control plane: AI tools can receive narrow Via capabilities for deploy/log/status workflows without getting SSH, host secrets, or broad shell access.
+Manage a small hardware fleet:
 
-## Current Status
+```bash
+via nodes
+via node ping rig
+via exec mac-mini -- uptime
+via exec pi -- df -h
+```
 
-Via is early but usable on machines you control.
+Deploy worker containers with command arguments:
 
-Works today:
+```bash
+via deploy alpine:latest --to rig --name ticker -- sh -lc 'while true; do date; sleep 5; done'
+via logs ticker
+```
 
-- initialize a mesh
-- add nodes over SSH bootstrap
-- run encrypted RPC between nodes
-- deploy Docker images
-- deploy with command arguments
-- inspect service/container state
-- read service logs
-- run host commands on nodes
-- store and sync encrypted secrets
-- inspect Via audit/system logs
-- install release binaries
-- check/install Via updates across the mesh
+Keep secrets inside the mesh instead of copying `.env` files around:
 
-Not ready yet:
+```bash
+via secret set OPENAI_API_KEY --value sk-...
+via secret list
+via deploy ghcr.io/acme/worker:latest --to rig --name worker
+```
 
-- public internet daemon exposure
-- per-node identity keys
-- capability tokens
-- service-scoped secret grants
-- launchd/systemd daemon installation
-- NAT traversal / relay mode
+Give automation a narrower control surface than SSH:
 
-For now, use Via on a LAN or a VPN/overlay network like Tailscale or WireGuard.
+```bash
+via exec rig -- docker ps
+via deploy nginx:latest --to rig --name preview --port 18081:80
+via logs preview --limit 100
+via rm preview
+```
+
+Update every reachable node:
+
+```bash
+via update --check
+via update --all
+```
+
+## Concepts
+
+**Mesh**
+
+A mesh is the set of machines sharing Via state and a mesh key. Initialize it once with `via init`, then add nodes with `via add`.
+
+**Node**
+
+A node is a machine in the mesh. Each node has a slug, daemon address, and local state. Nodes can run commands against one another through Via RPC.
+
+**Daemon**
+
+The daemon listens on port `47819` by default. It receives encrypted RPC requests from other Via nodes and performs local operations such as Docker deploys, logs, status checks, and node exec.
+
+**Service**
+
+A service is a Docker container Via knows about. Via records which node owns it, the target image/path, container name, port mapping, command args, and status.
+
+**Secret**
+
+A secret is encrypted at rest with the mesh key and synced through mesh state. Deploys currently receive mesh secrets as environment variables.
+
+## Network Model
+
+Use Via on machines reachable over a private network: LAN, Tailscale, WireGuard, or a similar overlay.
+
+Via daemons are not meant to be exposed directly to the public internet. Treat daemon reachability as administrative reachability.
+
+SSH is used only for bootstrap in `via add`. After a node joins, day-to-day control happens over Via RPC.
 
 ## Install
 
@@ -69,22 +105,22 @@ Install a specific release:
 curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.1.0
 ```
 
-The installer detects your OS/arch, downloads the matching GitHub release asset, verifies its SHA-256 checksum when available, and installs the binary to:
+The installer detects OS/architecture, downloads the matching GitHub release asset, verifies the SHA-256 checksum when available, installs the binary to:
 
 ```text
 ~/.via/bin/via
 ```
 
-It also adds `~/.via/bin` to your shell profile when it is not already on `PATH`.
+and adds `~/.via/bin` to the shell profile when needed.
 
-For local development, symlink the debug binary somewhere on your PATH:
+For local development:
 
 ```bash
 cargo build
 ln -sf "$PWD/target/debug/via" ~/.local/bin/via
 ```
 
-## Quick Start
+## First Mesh
 
 Initialize the first node:
 
@@ -98,9 +134,16 @@ Add another machine reachable over SSH:
 via add rig
 ```
 
-`via add` uses SSH only for bootstrap: it installs the released Via binary on the remote machine, copies mesh credentials, initializes the node, and starts the daemon.
+`via add` does four things:
 
-Check mesh health:
+1. SSHes into the target machine.
+2. Runs the release installer on the target.
+3. Copies the mesh key to `~/.via/mesh.key`.
+4. Initializes the node and starts the daemon.
+
+It does not copy Via source, compile remotely, or scp a local Via binary.
+
+Check the mesh:
 
 ```bash
 via doctor
@@ -108,22 +151,12 @@ via nodes
 via node ping rig
 ```
 
-Run a command on a node through Via:
+## Daily Operations
+
+Run a command on a node:
 
 ```bash
 via exec rig -- sh -lc 'hostname && uptime'
-```
-
-Deploy a container:
-
-```bash
-via deploy nginx:latest --to rig --name web --port 18080:80
-```
-
-Deploy with command arguments:
-
-```bash
-via deploy alpine:latest --to rig --name worker -- sh -lc 'while true; do date; sleep 5; done'
 ```
 
 Inspect services:
@@ -135,28 +168,20 @@ via status web
 via open web
 ```
 
-Operate services:
+Read logs:
 
 ```bash
 via logs web
+via logs
+via logs --limit 100
+```
+
+Operate services:
+
+```bash
 via stop web
 via restart web
 via rm web
-```
-
-Manage mesh secrets:
-
-```bash
-via secret set API_KEY --value super-secret
-via secret list
-via secret delete API_KEY
-```
-
-Read Via audit/system logs:
-
-```bash
-via logs
-via logs --limit 100
 ```
 
 Manage nodes:
@@ -167,7 +192,15 @@ via node rename rig laboratory
 via node rm laboratory
 ```
 
-Check and install Via updates:
+Manage secrets:
+
+```bash
+via secret set API_KEY --value super-secret
+via secret list
+via secret delete API_KEY
+```
+
+Update Via:
 
 ```bash
 via update --check
@@ -176,11 +209,34 @@ via update --node rig
 via update --all
 ```
 
-`via update --all` installs the new binary on each reachable node. Restart running Via daemons after updating so they execute the new version.
+Updating installs the new binary. Restart running daemons after updating so long-lived daemon processes execute the new version.
+
+## Command Reference
+
+| Command | Purpose |
+| --- | --- |
+| `via init --name laptop` | Create or refresh the local mesh node. |
+| `via add rig` | Bootstrap a machine over SSH and join it to the mesh. |
+| `via start` | Start the local daemon in the background. |
+| `via daemon` | Run the daemon in the foreground. |
+| `via doctor` | Check local state, mesh key, Docker, and node daemon reachability. |
+| `via nodes` | List mesh nodes. |
+| `via node ping rig` | Check one node daemon. |
+| `via exec rig -- <cmd>` | Run a command on a node through Via RPC. |
+| `via deploy <image> --to rig --name web` | Deploy a Docker image. |
+| `via deploy <path> --to rig --name app` | Deploy a local path to a node via Docker build. |
+| `via ps` | Show services with live container status. |
+| `via services` | Show recorded service state. |
+| `via logs web` | Read service logs. |
+| `via logs` | Read Via audit/system events. |
+| `via open web` | Print the local/private URL for a port-mapped service. |
+| `via rm web` | Remove a service and its container. |
+| `via secret set KEY --value value` | Store an encrypted mesh secret. |
+| `via update --all` | Install the current/latest Via release across reachable nodes. |
 
 ## Security Model
 
-Via currently uses a shared mesh key copied during `via add`. Treat that key as root authority for the mesh.
+Via currently uses a shared mesh key. That key is copied during `via add` and is root authority for the mesh.
 
 Implemented:
 
@@ -189,78 +245,100 @@ Implemented:
 - HMAC-signed RPC frames.
 - Timestamp validation.
 - Nonce replay rejection.
-- Unix mesh key permissions hardened to `0600`.
-- Audit events for mesh, node, service, and secret operations.
-- Secret audit events do not store values or ciphertext.
-- Service audit events do not store deploy command arguments.
-- Node exec audit events do not store command text.
+- Unix mesh key permissions set to `0600`.
+- Audit events for mesh, node, service, secret, update, and exec operations.
+- Secret audit events omit values and ciphertext.
+- Service audit events omit deploy command arguments.
+- Node exec audit events record node/argc/locality, not command text.
 
-Boundaries:
+Operational boundaries:
 
-- Via is not ready for raw public internet daemon exposure.
-- A compromised node can currently compromise the shared mesh key.
-- Node exec is intentionally powerful and should be treated like remote shell access.
-- Secrets are currently injected broadly during deploy; service-scoped grants are planned.
+- Do not expose the daemon directly to the public internet.
+- Treat `via exec` as remote shell access.
+- A compromised node can read the shared mesh key from that node.
+- Secrets are mesh-wide during deploy.
+- Via relies on Docker for container isolation.
 
-Near-term security roadmap:
+## Files
 
-- per-node identity keys or mTLS
-- node revocation
-- service-scoped secret grants
-- agent-scoped capability tokens
-- daemon rate limiting / lockouts
+```text
+~/.via/bin/via       installed binary
+~/.via/mesh.key      mesh key
+~/.via/lux/          embedded Lux state
+~/.via/logs/         Via logs
+~/.via/daemon.log    daemon stdout/stderr
+~/.via/daemon.pid    daemon pid file
+```
 
 ## Development
 
 ```bash
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --locked --all-targets
 cargo llvm-cov --summary-only
 ```
 
 Build a local release binary:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 via --version
 ```
 
-## CI / Releases
+## CI And Releases
 
-The repo includes GitHub Actions workflows but no GitHub repository is created by this project yet.
+Pull requests into `main` run:
 
-CI runs on pushes and pull requests:
+```text
+formatting -> tests -> build
+```
+
+The workflow is:
 
 ```text
 .github/workflows/ci.yml
 ```
 
-Release builds are tag-based. Push a version tag like `v0.1.0`:
+Releases are tag-based:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-That runs:
+The release workflow is:
 
 ```text
 .github/workflows/release.yml
 ```
 
-The release workflow builds and packages:
+It runs:
+
+```text
+formatting -> tests -> build binaries -> deploy release
+```
+
+Release assets:
 
 - `via-linux-x86_64.tar.gz`
 - `via-linux-arm64.tar.gz`
 - `via-macos-x86_64.tar.gz`
 - `via-macos-arm64.tar.gz`
 
-## Project Shape
+## Architecture
 
-Via is a Rust binary crate. It uses embedded Lux for local state and Docker for container runtime operations.
+Via is a Rust binary crate. It embeds Lux for local state and uses Docker for container runtime operations.
 
-State currently uses Lux KV/documents plus a Lux table for audit events. More of the state model will move to Lux tables as the data layer stabilizes.
+Important modules:
+
+- `src/cli.rs`: CLI command definitions.
+- `src/main.rs`: command handlers.
+- `src/ssh.rs`: SSH bootstrap and path deploy transfer helpers.
+- `src/rpc.rs`: encrypted/signed node RPC.
+- `src/security.rs`: mesh key, encryption, HMAC, nonce utilities.
+- `src/state.rs`: embedded Lux state model.
+- `src/docker.rs`: Docker command construction and execution.
 
 ## License
 
