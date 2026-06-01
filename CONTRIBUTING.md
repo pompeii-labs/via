@@ -10,13 +10,7 @@ cd via
 cargo build
 ```
 
-Via currently depends on a sibling Lux checkout when building from source:
-
-```text
-../..
-├── Lux/lux
-└── Pompeii/via
-```
+Via depends on the public `lux-db/lux` release pinned in `Cargo.toml`.
 
 ## Checks
 
