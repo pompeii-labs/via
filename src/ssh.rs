@@ -8,15 +8,12 @@ pub async fn bootstrap(
     slug: &str,
     mesh_id: &str,
     node_id: &str,
-    local_binary: Option<String>,
 ) -> Result<()> {
     let remote_bin = "~/.via/bin/via";
+    run("ssh", &[host, "mkdir -p ~/.via ~/.via/lux ~/.via/logs"])?;
     run(
         "ssh",
-        &[
-            host,
-            "mkdir -p ~/.via/bin ~/.via/lux ~/.via/logs ~/.via/builds ~/.via/src",
-        ],
+        &[host, &remote_install_command(env!("CARGO_PKG_VERSION"))],
     )?;
     run(
         "scp",
@@ -28,53 +25,7 @@ pub async fn bootstrap(
             &format!("{host}:~/.via/mesh.key"),
         ],
     )?;
-    if let Some(local_binary) = local_binary {
-        let remote_tmp = "~/.via/bin/via.tmp";
-        run("scp", &[&local_binary, &format!("{host}:{remote_tmp}")])?;
-        run(
-            "ssh",
-            &[
-                host,
-                &format!(
-                    "chmod +x {remote_tmp} && {remote_tmp} --help >/dev/null && mv {remote_tmp} {remote_bin}"
-                ),
-            ],
-        )?;
-    } else {
-        let source_root = env!("CARGO_MANIFEST_DIR");
-        let lux_root = std::path::Path::new(source_root)
-            .parent()
-            .and_then(std::path::Path::parent)
-            .map(|root| root.join("Lux/lux"))
-            .context("failed to locate local Lux checkout")?;
-        let remote_src = "~/.via/src/Pompeii/via";
-        let remote_lux = "~/.via/src/Lux/lux";
-        copy_dir(host, source_root, remote_src)?;
-        copy_dir(
-            host,
-            lux_root
-                .to_str()
-                .context("local Lux checkout path is not UTF-8")?,
-            remote_lux,
-        )?;
-        let build_cmd = format!(
-            r#"set -e
-cd {remote_src}
-if command -v cargo >/dev/null 2>&1; then
-  cargo build --release
-elif command -v docker >/dev/null 2>&1; then
-  docker run --rm -v "$HOME/.via/src:/src" -w /src/Pompeii/via rust:1-bookworm cargo build --release
-else
-  echo "Via bootstrap needs Cargo or Docker on the remote node." >&2
-  echo "Install Rust/Cargo, or install Docker so Via can build itself in a Rust container." >&2
-  exit 127
-fi
-cp target/release/via {remote_bin}.next
-chmod +x {remote_bin}.next
-mv -f {remote_bin}.next {remote_bin}"#
-        );
-        run("ssh", &[host, &build_cmd])?;
-    }
+    run("ssh", &[host, "chmod 600 ~/.via/mesh.key"])?;
     run(
         "ssh",
         &[
@@ -86,6 +37,12 @@ mv -f {remote_bin}.next {remote_bin}"#
     )?;
     paths.ensure()?;
     Ok(())
+}
+
+fn remote_install_command(version: &str) -> String {
+    format!(
+        "if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- {version}; elif command -v wget >/dev/null 2>&1; then wget -q https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh -O - | bash -s -- {version}; else echo 'Via bootstrap needs curl or wget on the remote node.' >&2; exit 127; fi"
+    )
 }
 
 pub fn remote(host: &str, command: &str) -> Result<()> {
@@ -138,4 +95,20 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
         bail!("{program} failed with status {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_install_command;
+
+    #[test]
+    fn remote_install_command_uses_release_installer() {
+        let command = remote_install_command("0.1.0");
+        assert!(command.contains("raw.githubusercontent.com/pompeii-labs/via/main/install.sh"));
+        assert!(command.contains("bash -s -- 0.1.0"));
+        assert!(command.contains("curl"));
+        assert!(command.contains("wget"));
+        assert!(!command.contains("cargo"));
+        assert!(!command.contains("rsync"));
+    }
 }

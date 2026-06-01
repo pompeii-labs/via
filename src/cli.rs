@@ -26,8 +26,6 @@ pub enum Command {
         name: Option<String>,
         #[arg(long)]
         public: bool,
-        #[arg(long)]
-        local_binary: Option<String>,
     },
     Start {
         #[arg(long, default_value = "0.0.0.0:47819")]

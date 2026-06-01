@@ -98,6 +98,8 @@ Add another machine reachable over SSH:
 via add rig
 ```
 
+`via add` uses SSH only for bootstrap: it installs the released Via binary on the remote machine, copies mesh credentials, initializes the node, and starts the daemon.
+
 Check mesh health:
 
 ```bash

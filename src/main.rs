@@ -39,9 +39,8 @@ async fn main() -> Result<()> {
             ssh_host,
             name,
             public,
-            local_binary,
         } => {
-            commands::add_node(&mut state, &paths, ssh_host, name, public, local_binary).await?;
+            commands::add_node(&mut state, &paths, ssh_host, name, public).await?;
         }
         Command::Start { bind } => {
             commands::start(&paths, bind).await?;
@@ -215,7 +214,6 @@ mod commands {
         ssh_host: String,
         name: Option<String>,
         public: bool,
-        local_binary: Option<String>,
     ) -> Result<()> {
         let mesh = state
             .mesh()
@@ -228,7 +226,7 @@ mod commands {
             .as_ref()
             .map(|node| node.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        ssh::bootstrap(&ssh_host, paths, &slug, &mesh.id, &node_id, local_binary).await?;
+        ssh::bootstrap(&ssh_host, paths, &slug, &mesh.id, &node_id).await?;
         let daemon_host = ssh::resolved_hostname(&ssh_host).unwrap_or_else(|_| ssh_host.clone());
         let daemon_addr = format!("{daemon_host}:47819");
         crate::rpc::wait_until_ready(&daemon_addr).await?;
