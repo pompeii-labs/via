@@ -10,18 +10,18 @@ uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 
 case "$uname_s" in
-  Darwin) os="apple-darwin" ;;
-  Linux) os="unknown-linux-gnu" ;;
+  Darwin) os="macos" ;;
+  Linux) os="linux" ;;
   *) echo "unsupported OS: $uname_s" >&2; exit 1 ;;
 esac
 
 case "$uname_m" in
-  arm64|aarch64) arch="aarch64" ;;
+  arm64|aarch64) arch="arm64" ;;
   x86_64|amd64) arch="x86_64" ;;
   *) echo "unsupported architecture: $uname_m" >&2; exit 1 ;;
 esac
 
-target="$arch-$os"
+artifact="$APP_NAME-$os-$arch"
 
 need_downloader() {
   if command -v curl >/dev/null 2>&1; then
@@ -117,7 +117,7 @@ update_path() {
 
 need_downloader
 version="$(resolve_version)"
-archive="$APP_NAME-$version-$target.tar.gz"
+archive="$artifact.tar.gz"
 base_url="${VIA_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download/v$version}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

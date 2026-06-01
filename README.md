@@ -200,6 +200,7 @@ Near-term security roadmap:
 
 ```bash
 cargo fmt
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo llvm-cov --summary-only
 ```
@@ -220,7 +221,14 @@ CI runs on pushes and pull requests:
 .github/workflows/ci.yml
 ```
 
-Release builds run on tags like `v0.1.0`:
+Release builds are tag-based. Push a version tag like `v0.1.0`:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That runs:
 
 ```text
 .github/workflows/release.yml
@@ -228,10 +236,10 @@ Release builds run on tags like `v0.1.0`:
 
 The release workflow builds and packages:
 
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
+- `via-linux-x86_64.tar.gz`
+- `via-linux-arm64.tar.gz`
+- `via-macos-x86_64.tar.gz`
+- `via-macos-arm64.tar.gz`
 
 ## Project Shape
 

@@ -23,114 +23,6 @@ pub async fn run(bind: String, paths: ViaPaths) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::run;
-    use crate::paths::ViaPaths;
-    use crate::rpc::{self, RpcResponse};
-    use tempfile::TempDir;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
-    use tokio::time::{sleep, Duration};
-
-    #[tokio::test]
-    async fn daemon_responds_to_ping() {
-        let temp = TempDir::new().unwrap();
-        let paths = ViaPaths {
-            root: temp.path().to_path_buf(),
-            lux: temp.path().join("lux"),
-            logs: temp.path().join("logs"),
-            bin: temp.path().join("bin"),
-            mesh_key: temp.path().join("mesh.key"),
-        };
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = std_listener.local_addr().unwrap();
-        drop(std_listener);
-
-        let bind = addr.to_string();
-        let client_paths = paths.clone();
-        let task = tokio::spawn(async move {
-            let _ = run(bind, paths).await;
-        });
-
-        let mut last_error = None;
-        for _ in 0..25 {
-            match rpc::call_with_paths(&addr.to_string(), &client_paths, rpc::RpcRequest::Ping)
-                .await
-            {
-                Ok(rpc::RpcResponse::Pong) => {
-                    task.abort();
-                    return;
-                }
-                Ok(response) => {
-                    last_error = Some(anyhow::anyhow!("unexpected response: {response:?}"));
-                    sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    sleep(Duration::from_millis(20)).await;
-                }
-            }
-        }
-        task.abort();
-        panic!("daemon did not respond to ping: {last_error:?}");
-    }
-
-    #[tokio::test]
-    async fn daemon_rejects_replayed_signed_rpc_nonces() {
-        let temp = TempDir::new().unwrap();
-        let paths = ViaPaths {
-            root: temp.path().to_path_buf(),
-            lux: temp.path().join("lux"),
-            logs: temp.path().join("logs"),
-            bin: temp.path().join("bin"),
-            mesh_key: temp.path().join("mesh.key"),
-        };
-        crate::security::ensure_mesh_key(&paths).unwrap();
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = std_listener.local_addr().unwrap();
-        drop(std_listener);
-
-        let bind = addr.to_string();
-        let client_paths = paths.clone();
-        let task = tokio::spawn(async move {
-            let _ = run(bind, paths).await;
-        });
-
-        let mut ready = false;
-        for _ in 0..25 {
-            match rpc::call_with_paths(&addr.to_string(), &client_paths, rpc::RpcRequest::Ping)
-                .await
-            {
-                Ok(RpcResponse::Pong) => {
-                    ready = true;
-                    break;
-                }
-                _ => sleep(Duration::from_millis(20)).await,
-            }
-        }
-        assert!(ready, "daemon did not become ready");
-
-        let encoded = rpc::encode_request(&client_paths, rpc::RpcRequest::Ping).unwrap();
-        let first = send_raw_rpc(&addr.to_string(), &client_paths, &encoded).await;
-        let second = send_raw_rpc(&addr.to_string(), &client_paths, &encoded).await;
-        task.abort();
-
-        assert!(matches!(first, RpcResponse::Pong));
-        assert!(matches!(second, RpcResponse::Error { message } if message.contains("replayed")));
-    }
-
-    async fn send_raw_rpc(addr: &str, paths: &ViaPaths, encoded: &[u8]) -> RpcResponse {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(encoded).await.unwrap();
-        stream.write_all(b"\n").await.unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        rpc::decode_response(paths, &line).unwrap()
-    }
-}
-
 async fn handle_connection(
     state: &mut ViaState,
     paths: &ViaPaths,
@@ -241,5 +133,113 @@ async fn handle_request(state: &mut ViaState, request: RpcRequest) -> Result<Rpc
             docker::local_docker_check()?;
             Ok(RpcResponse::Ok)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run;
+    use crate::paths::ViaPaths;
+    use crate::rpc::{self, RpcResponse};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn daemon_responds_to_ping() {
+        let temp = TempDir::new().unwrap();
+        let paths = ViaPaths {
+            root: temp.path().to_path_buf(),
+            lux: temp.path().join("lux"),
+            logs: temp.path().join("logs"),
+            bin: temp.path().join("bin"),
+            mesh_key: temp.path().join("mesh.key"),
+        };
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        drop(std_listener);
+
+        let bind = addr.to_string();
+        let client_paths = paths.clone();
+        let task = tokio::spawn(async move {
+            let _ = run(bind, paths).await;
+        });
+
+        let mut last_error = None;
+        for _ in 0..25 {
+            match rpc::call_with_paths(&addr.to_string(), &client_paths, rpc::RpcRequest::Ping)
+                .await
+            {
+                Ok(rpc::RpcResponse::Pong) => {
+                    task.abort();
+                    return;
+                }
+                Ok(response) => {
+                    last_error = Some(anyhow::anyhow!("unexpected response: {response:?}"));
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        task.abort();
+        panic!("daemon did not respond to ping: {last_error:?}");
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_replayed_signed_rpc_nonces() {
+        let temp = TempDir::new().unwrap();
+        let paths = ViaPaths {
+            root: temp.path().to_path_buf(),
+            lux: temp.path().join("lux"),
+            logs: temp.path().join("logs"),
+            bin: temp.path().join("bin"),
+            mesh_key: temp.path().join("mesh.key"),
+        };
+        crate::security::ensure_mesh_key(&paths).unwrap();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        drop(std_listener);
+
+        let bind = addr.to_string();
+        let client_paths = paths.clone();
+        let task = tokio::spawn(async move {
+            let _ = run(bind, paths).await;
+        });
+
+        let mut ready = false;
+        for _ in 0..25 {
+            match rpc::call_with_paths(&addr.to_string(), &client_paths, rpc::RpcRequest::Ping)
+                .await
+            {
+                Ok(RpcResponse::Pong) => {
+                    ready = true;
+                    break;
+                }
+                _ => sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(ready, "daemon did not become ready");
+
+        let encoded = rpc::encode_request(&client_paths, rpc::RpcRequest::Ping).unwrap();
+        let first = send_raw_rpc(&addr.to_string(), &client_paths, &encoded).await;
+        let second = send_raw_rpc(&addr.to_string(), &client_paths, &encoded).await;
+        task.abort();
+
+        assert!(matches!(first, RpcResponse::Pong));
+        assert!(matches!(second, RpcResponse::Error { message } if message.contains("replayed")));
+    }
+
+    async fn send_raw_rpc(addr: &str, paths: &ViaPaths, encoded: &[u8]) -> RpcResponse {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(encoded).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        rpc::decode_response(paths, &line).unwrap()
     }
 }

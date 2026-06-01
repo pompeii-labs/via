@@ -338,7 +338,7 @@ mod commands {
             println!("No nodes. Run `via init` first.");
             return Ok(());
         }
-        println!("{:<18} {:<8} {}", "NAME", "PUBLIC", "ADDRESS");
+        println!("{:<18} {:<8} ADDRESS", "NAME", "PUBLIC");
         for node in nodes {
             println!(
                 "{:<18} {:<8} {}",
@@ -469,26 +469,24 @@ mod commands {
                     other => bail!("unexpected deploy response: {other:?}"),
                 }
             }
+        } else if node.last_seen_at.is_some() {
+            docker::deploy_image(&node, &target, &container, port, &env, &command).await?
         } else {
-            if node.last_seen_at.is_some() {
-                docker::deploy_image(&node, &target, &container, port, &env, &command).await?
-            } else {
-                match crate::rpc::call(
-                    &node.daemon_addr,
-                    crate::rpc::RpcRequest::DeployImage {
-                        image: target,
-                        service: service_name.clone(),
-                        container,
-                        port,
-                        env,
-                        command,
-                    },
-                )
-                .await?
-                {
-                    crate::rpc::RpcResponse::Service { service } => service,
-                    other => bail!("unexpected deploy response: {other:?}"),
-                }
+            match crate::rpc::call(
+                &node.daemon_addr,
+                crate::rpc::RpcRequest::DeployImage {
+                    image: target,
+                    service: service_name.clone(),
+                    container,
+                    port,
+                    env,
+                    command,
+                },
+            )
+            .await?
+            {
+                crate::rpc::RpcResponse::Service { service } => service,
+                other => bail!("unexpected deploy response: {other:?}"),
             }
         };
         service.node_addr = node.daemon_addr.clone();
@@ -533,10 +531,7 @@ mod commands {
             println!("No services.");
             return Ok(());
         }
-        println!(
-            "{:<18} {:<18} {:<10} {}",
-            "NAME", "NODE", "STATUS", "TARGET"
-        );
+        println!("{:<18} {:<18} {:<10} TARGET", "NAME", "NODE", "STATUS");
         for service in services {
             println!(
                 "{:<18} {:<18} {:<10} {}",
