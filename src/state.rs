@@ -398,6 +398,14 @@ fn sanitized_event(event: &Event) -> Event {
             return event;
         }
     }
+    if event.kind.starts_with("service.") {
+        if let Some(mut payload) = event.payload.as_object().cloned() {
+            payload.remove("command");
+            let mut event = event.clone();
+            event.payload = serde_json::Value::Object(payload);
+            return event;
+        }
+    }
     event.clone()
 }
 
@@ -645,6 +653,41 @@ mod tests {
             .unwrap();
         let rows = String::from_utf8_lossy(&rows);
         assert!(!rows.contains("ciphertext"), "table rows: {rows}");
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_events_do_not_log_command_args() {
+        let temp = TempDir::new().unwrap();
+        let paths = ViaPaths {
+            root: temp.path().to_path_buf(),
+            lux: temp.path().join("lux"),
+            logs: temp.path().join("logs"),
+            bin: temp.path().join("bin"),
+            mesh_key: temp.path().join("mesh.key"),
+        };
+        let mut state = ViaState::open(paths).await.unwrap();
+        state
+            .append_event(
+                "service.started",
+                &serde_json::json!({
+                    "name": "api",
+                    "target": "node:22",
+                    "command": ["sh", "-lc", "echo secret"]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let events = state.events(10).await.unwrap();
+        assert!(events[0].payload.get("command").is_none());
+        let rows = state
+            .client
+            .execute("TSELECT", &["*", "FROM", EVENT_TABLE])
+            .await
+            .unwrap();
+        let rows = String::from_utf8_lossy(&rows);
+        assert!(!rows.contains("echo secret"), "table rows: {rows}");
         state.shutdown().await.unwrap();
     }
 }
