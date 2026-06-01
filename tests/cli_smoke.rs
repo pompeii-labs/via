@@ -1,6 +1,50 @@
 use std::process::Command;
 
 #[test]
+fn version_flag_reports_package_version() {
+    let via = env!("CARGO_BIN_EXE_via");
+
+    let output = Command::new(via).arg("--version").output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("via 0.1.0"), "unexpected stdout: {stdout}");
+}
+
+#[test]
+fn update_check_reports_available_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let via = env!("CARGO_BIN_EXE_via");
+
+    let output = Command::new(via)
+        .env("HOME", temp.path())
+        .env("VIA_UPDATE_VERSION", "0.1.1")
+        .args(["update", "--check"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "update check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("current: 0.1.0"),
+        "unexpected stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("latest:  0.1.1"),
+        "unexpected stdout: {stdout}"
+    );
+    assert!(stdout.contains("available"), "unexpected stdout: {stdout}");
+}
+
+#[test]
 fn init_and_nodes_persist_state() {
     let temp = tempfile::tempdir().unwrap();
     let via = env!("CARGO_BIN_EXE_via");

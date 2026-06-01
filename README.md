@@ -42,6 +42,7 @@ Works today:
 - store and sync encrypted secrets
 - inspect Via audit/system logs
 - install release binaries
+- check/install Via updates across the mesh
 
 Not ready yet:
 
@@ -164,6 +165,17 @@ via node rename rig laboratory
 via node rm laboratory
 ```
 
+Check and install Via updates:
+
+```bash
+via update --check
+via update
+via update --node rig
+via update --all
+```
+
+`via update --all` installs the new binary on each reachable node. Restart running Via daemons after updating so they execute the new version.
+
 ## Security Model
 
 Via currently uses a shared mesh key copied during `via add`. Treat that key as root authority for the mesh.
@@ -209,6 +221,7 @@ Build a local release binary:
 
 ```bash
 cargo build --release
+via --version
 ```
 
 ## CI / Releases

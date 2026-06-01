@@ -103,6 +103,14 @@ async fn main() -> Result<()> {
         Command::Open { service } => {
             commands::open(&state, service).await?;
         }
+        Command::Update {
+            check,
+            all,
+            node,
+            version,
+        } => {
+            commands::update(&mut state, check, all, node, version).await?;
+        }
         Command::Publish { service, private } => {
             commands::publish(&mut state, service, private).await?;
         }
@@ -135,6 +143,9 @@ mod commands {
     use std::path::PathBuf;
     use std::process::Command as ProcessCommand;
     use uuid::Uuid;
+
+    const UPDATE_REPO: &str = "pompeii-labs/via";
+    const INSTALL_URL: &str = "https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh";
 
     pub async fn init(
         state: &mut ViaState,
@@ -718,6 +729,183 @@ mod commands {
         Ok(())
     }
 
+    pub async fn update(
+        state: &mut ViaState,
+        check: bool,
+        all: bool,
+        node: Option<String>,
+        version: Option<String>,
+    ) -> Result<()> {
+        if all && node.is_some() {
+            bail!("use either --all or --node, not both");
+        }
+
+        let latest = match version {
+            Some(version) => version.trim_start_matches('v').to_string(),
+            None => latest_release_version()?,
+        };
+
+        if check {
+            print_update_check(&latest);
+            return Ok(());
+        }
+
+        let scope = if all {
+            "all"
+        } else if node.is_some() {
+            "node"
+        } else {
+            "local"
+        };
+
+        if all {
+            let local_node = state.local_node().await?;
+            for node in state.nodes().await? {
+                update_node(&node, node.id == local_node.id, &latest).await?;
+            }
+        } else if let Some(node_slug) = node {
+            let node = state
+                .node_by_slug(&node_slug)
+                .await?
+                .ok_or_else(|| anyhow!("unknown node '{node_slug}'"))?;
+            let local = state.local_node().await?.id == node.id;
+            update_node(&node, local, &latest).await?;
+        } else {
+            update_local(&latest)?;
+        }
+
+        if state.mesh().await?.is_some() {
+            state
+                .append_event(
+                    "via.updated",
+                    &serde_json::json!({
+                        "version": latest,
+                        "scope": scope
+                    }),
+                )
+                .await?;
+            state.persist().await?;
+            sync_all(state).await?;
+        }
+        println!("Via binaries updated. Restart running daemons to use the new binary.");
+        Ok(())
+    }
+
+    fn print_update_check(latest: &str) {
+        let current = env!("CARGO_PKG_VERSION");
+        println!("current: {current}");
+        println!("latest:  {latest}");
+        if version_newer(latest, current) {
+            println!("update:  available");
+        } else {
+            println!("update:  not needed");
+        }
+    }
+
+    async fn update_node(node: &Node, local: bool, version: &str) -> Result<()> {
+        println!("Updating '{}' to {}...", node.slug, version);
+        let output = if local {
+            run_update_installer(version)?
+        } else {
+            match crate::rpc::call(
+                &node.daemon_addr,
+                crate::rpc::RpcRequest::Exec {
+                    command: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        update_shell_command(version),
+                    ],
+                },
+            )
+            .await?
+            {
+                crate::rpc::RpcResponse::Exec { output } => output,
+                other => bail!("unexpected update response: {other:?}"),
+            }
+        };
+        print!("{output}");
+        Ok(())
+    }
+
+    fn update_local(version: &str) -> Result<()> {
+        println!("Updating local Via binary to {}...", version);
+        let output = run_update_installer(version)?;
+        print!("{output}");
+        Ok(())
+    }
+
+    fn run_update_installer(version: &str) -> Result<String> {
+        crate::util::run_command_capture(&[
+            "sh".to_string(),
+            "-lc".to_string(),
+            update_shell_command(version),
+        ])
+    }
+
+    fn update_shell_command(version: &str) -> String {
+        format!(
+            "if command -v curl >/dev/null 2>&1; then curl -fsSL {INSTALL_URL} | bash -s -- {version}; elif command -v wget >/dev/null 2>&1; then wget -q {INSTALL_URL} -O - | bash -s -- {version}; else echo 'update needs curl or wget' >&2; exit 1; fi"
+        )
+    }
+
+    fn latest_release_version() -> Result<String> {
+        if let Ok(version) = std::env::var("VIA_UPDATE_VERSION") {
+            return Ok(version.trim_start_matches('v').to_string());
+        }
+        let repo = std::env::var("VIA_UPDATE_REPO").unwrap_or_else(|_| UPDATE_REPO.to_string());
+        let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+        let body = download_stdout(&url)?;
+        parse_latest_release_version(&body)
+            .ok_or_else(|| anyhow!("could not find latest Via release at {url}"))
+    }
+
+    fn download_stdout(url: &str) -> Result<String> {
+        let output = if command_exists("curl") {
+            ProcessCommand::new("curl").args(["-fsSL", url]).output()
+        } else if command_exists("wget") {
+            ProcessCommand::new("wget")
+                .args(["-q", url, "-O", "-"])
+                .output()
+        } else {
+            bail!("update needs curl or wget");
+        }
+        .context("failed to run release lookup")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("release lookup failed: {stderr}");
+        }
+        Ok(stdout)
+    }
+
+    fn command_exists(command: &str) -> bool {
+        ProcessCommand::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {command} >/dev/null 2>&1"))
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn parse_latest_release_version(body: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        value
+            .get("tag_name")?
+            .as_str()
+            .map(|tag| tag.trim_start_matches('v').to_string())
+    }
+
+    fn version_newer(latest: &str, current: &str) -> bool {
+        version_parts(latest) > version_parts(current)
+    }
+
+    fn version_parts(version: &str) -> Vec<u64> {
+        version
+            .trim_start_matches('v')
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+
     pub async fn publish(state: &mut ViaState, service: String, private: bool) -> Result<()> {
         if !private {
             bail!("V1 only supports private publishing; pass --private");
@@ -883,5 +1071,32 @@ mod commands {
             bail!("hostname command failed");
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{parse_latest_release_version, update_shell_command, version_newer};
+
+        #[test]
+        fn parses_latest_release_version() {
+            let body = r#"{"tag_name":"v0.1.2"}"#;
+            assert_eq!(parse_latest_release_version(body).as_deref(), Some("0.1.2"));
+        }
+
+        #[test]
+        fn compares_versions() {
+            assert!(version_newer("0.1.1", "0.1.0"));
+            assert!(version_newer("v0.2.0", "0.1.9"));
+            assert!(!version_newer("0.1.0", "0.1.0"));
+            assert!(!version_newer("0.1.0", "0.1.1"));
+        }
+
+        #[test]
+        fn update_shell_command_pins_version() {
+            let command = update_shell_command("0.1.0");
+            assert!(command.contains("bash -s -- 0.1.0"));
+            assert!(command.contains("curl"));
+            assert!(command.contains("wget"));
+        }
     }
 }

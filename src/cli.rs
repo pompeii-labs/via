@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "via")]
+#[command(version)]
 #[command(about = "Run services across machines you own")]
 pub struct Cli {
     #[command(subcommand)]
@@ -76,6 +77,16 @@ pub enum Command {
     },
     Open {
         service: String,
+    },
+    Update {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
     },
     Publish {
         service: String,
