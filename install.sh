@@ -17,7 +17,13 @@ esac
 
 case "$uname_m" in
   arm64|aarch64) arch="arm64" ;;
-  x86_64|amd64) arch="x86_64" ;;
+  x86_64|amd64)
+    if [ "$os" = "macos" ]; then
+      echo "unsupported architecture: Via does not publish Intel macOS binaries yet" >&2
+      exit 1
+    fi
+    arch="x86_64"
+    ;;
   *) echo "unsupported architecture: $uname_m" >&2; exit 1 ;;
 esac
 

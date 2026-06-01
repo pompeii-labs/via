@@ -328,7 +328,6 @@ Release assets:
 
 - `via-linux-x86_64.tar.gz`
 - `via-linux-arm64.tar.gz`
-- `via-macos-x86_64.tar.gz`
 - `via-macos-arm64.tar.gz`
 
 ## Architecture

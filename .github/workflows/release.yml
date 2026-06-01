@@ -71,11 +71,8 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             artifact: via-linux-arm64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            artifact: via-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             artifact: via-macos-arm64
     runs-on: ${{ matrix.os }}
     defaults:
