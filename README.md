@@ -1,5 +1,9 @@
 # Via
 
+<p align="center">
+  <img src="assets/via-logo-512.png" alt="Via logo" width="180">
+</p>
+
 Via is a private mesh control plane for machines you own.
 
 It lets a laptop, desktop rig, Mac mini, Raspberry Pi, or server join one small trusted mesh so you can deploy containers, inspect services, run commands, read logs, and sync encrypted state without giving every tool SSH keys or raw Docker socket access.
@@ -37,7 +41,7 @@ Works today:
 - run host commands on nodes
 - store and sync encrypted secrets
 - inspect Via audit/system logs
-- build/install local binaries
+- install release binaries
 
 Not ready yet:
 
@@ -52,29 +56,31 @@ For now, use Via on a LAN or a VPN/overlay network like Tailscale or WireGuard.
 
 ## Install
 
-From a checkout:
+Install the latest release:
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash
 ```
 
-By default this builds with Cargo and installs:
+Install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.1.0
+```
+
+The installer detects your OS/arch, downloads the matching GitHub release asset, verifies its SHA-256 checksum when available, and installs the binary to:
 
 ```text
 ~/.via/bin/via
 ```
+
+It also adds `~/.via/bin` to your shell profile when it is not already on `PATH`.
 
 For local development, symlink the debug binary somewhere on your PATH:
 
 ```bash
 cargo build
 ln -sf "$PWD/target/debug/via" ~/.local/bin/via
-```
-
-After public releases exist, install a release archive with:
-
-```bash
-VIA_VERSION=0.1.0 ./install.sh
 ```
 
 ## Quick Start
@@ -198,11 +204,10 @@ cargo test
 cargo llvm-cov --summary-only
 ```
 
-Build release archives locally:
+Build a local release binary:
 
 ```bash
-scripts/build-release.sh
-scripts/package-release.sh
+cargo build --release
 ```
 
 ## CI / Releases

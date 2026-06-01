@@ -62,7 +62,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/via" via
           tar -czf "dist/${archive}" via
-          shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
+          (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
