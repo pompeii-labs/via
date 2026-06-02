@@ -506,6 +506,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn imported_snapshot_preserves_remote_iroh_addresses() {
+        let temp = TempDir::new().unwrap();
+        let paths = ViaPaths {
+            root: temp.path().to_path_buf(),
+            lux: temp.path().join("lux"),
+            logs: temp.path().join("logs"),
+            bin: temp.path().join("bin"),
+            mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
+        };
+        let mut state = ViaState::open(paths).await.unwrap();
+        state
+            .import_snapshot(crate::model::MeshSnapshot {
+                mesh: None,
+                nodes: vec![Node {
+                    id: "laptop-node".to_string(),
+                    slug: "laptop".to_string(),
+                    display_name: "laptop".to_string(),
+                    addresses: vec!["laptop.local".to_string()],
+                    daemon_addr: "laptop.local:47819".to_string(),
+                    iroh_addr: Some("{\"id\":\"peer\"}".to_string()),
+                    public: false,
+                    created_at: 1,
+                    last_seen_at: Some(2),
+                }],
+                services: vec![],
+                secrets: vec![],
+                events: vec![],
+            })
+            .await
+            .unwrap();
+
+        let node = state.node_by_slug("laptop").await.unwrap().unwrap();
+        assert_eq!(node.iroh_addr.as_deref(), Some("{\"id\":\"peer\"}"));
+        assert_eq!(node.last_seen_at, None);
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn persists_secrets() {
         let temp = TempDir::new().unwrap();
         let paths = ViaPaths {

@@ -388,12 +388,17 @@ mod commands {
             println!("No nodes. Run `via init` first.");
             return Ok(());
         }
-        println!("{:<18} {:<8} ADDRESS", "NAME", "PUBLIC");
+        println!("{:<18} {:<8} {:<6} ADDRESS", "NAME", "PUBLIC", "IROH");
         for node in nodes {
             println!(
-                "{:<18} {:<8} {}",
+                "{:<18} {:<8} {:<6} {}",
                 node.slug,
                 if node.public { "yes" } else { "no" },
+                if node.iroh_addr.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                },
                 node.addresses.join(",")
             );
         }
@@ -1124,6 +1129,7 @@ mod commands {
     }
 
     async fn sync_all(state: &ViaState) -> Result<()> {
+        refresh_local_node_info(state).await;
         let snapshot = state.snapshot().await?;
         for node in snapshot.nodes.iter() {
             if node.last_seen_at.is_some() {
@@ -1143,6 +1149,27 @@ mod commands {
             }
         }
         Ok(())
+    }
+
+    async fn refresh_local_node_info(state: &ViaState) {
+        let Ok(mut local) = state.local_node().await else {
+            return;
+        };
+        let Ok(crate::rpc::RpcResponse::NodeInfo { iroh_addr }) =
+            crate::rpc::call(&local.daemon_addr, crate::rpc::RpcRequest::NodeInfo).await
+        else {
+            return;
+        };
+        if iroh_addr.is_some() && local.iroh_addr != iroh_addr {
+            local.iroh_addr = iroh_addr;
+            if let Err(error) = state.upsert_node(&local).await {
+                eprintln!("warning: failed to refresh local node iroh address: {error}");
+                return;
+            }
+            if let Err(error) = state.persist().await {
+                eprintln!("warning: failed to persist local node iroh address: {error}");
+            }
+        }
     }
 
     async fn resolve_service_node_addr(
