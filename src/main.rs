@@ -1155,9 +1155,17 @@ mod commands {
         let Ok(mut local) = state.local_node().await else {
             return;
         };
-        let Ok(crate::rpc::RpcResponse::NodeInfo { iroh_addr }) =
-            crate::rpc::call(&local.daemon_addr, crate::rpc::RpcRequest::NodeInfo).await
-        else {
+        let mut iroh_addr = None;
+        for daemon_addr in local_daemon_addrs(&local) {
+            if let Ok(crate::rpc::RpcResponse::NodeInfo {
+                iroh_addr: node_iroh_addr,
+            }) = crate::rpc::call(&daemon_addr, crate::rpc::RpcRequest::NodeInfo).await
+            {
+                iroh_addr = node_iroh_addr;
+                break;
+            }
+        }
+        if iroh_addr.is_none() {
             return;
         };
         if iroh_addr.is_some() && local.iroh_addr != iroh_addr {
@@ -1170,6 +1178,12 @@ mod commands {
                 eprintln!("warning: failed to persist local node iroh address: {error}");
             }
         }
+    }
+
+    fn local_daemon_addrs(local: &crate::model::Node) -> Vec<String> {
+        let mut addrs = vec![local.daemon_addr.clone(), "127.0.0.1:47819".to_string()];
+        addrs.dedup();
+        addrs
     }
 
     async fn resolve_service_node_addr(

@@ -327,14 +327,14 @@ git push origin v0.2.0
 Prereleases use the same workflow and assets, but are marked as GitHub prereleases when the tag contains `-alpha`, `-beta`, or `-rc`:
 
 ```bash
-git tag v0.2.0-alpha.3
-git push origin v0.2.0-alpha.3
+git tag v0.2.0-alpha.4
+git push origin v0.2.0-alpha.4
 ```
 
 Install a prerelease explicitly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.2.0-alpha.3
+curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.2.0-alpha.4
 ```
 
 `latest` installs continue to resolve only stable GitHub releases, not prereleases.
