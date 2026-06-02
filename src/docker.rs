@@ -309,6 +309,7 @@ mod tests {
             display_name: "rig".to_string(),
             addresses,
             daemon_addr: "rig:47819".to_string(),
+            iroh_addr: None,
             public: false,
             created_at: 1,
             last_seen_at,

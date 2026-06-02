@@ -7,6 +7,7 @@ mod rpc;
 mod security;
 mod ssh;
 mod state;
+mod transport;
 mod util;
 
 use anyhow::Result;
@@ -55,8 +56,8 @@ async fn main() -> Result<()> {
             NodeCommand::Addr { node, address } => {
                 commands::set_node_addr(&mut state, node, address).await?;
             }
-            NodeCommand::Ping { node } => {
-                commands::node_ping(&state, node).await?;
+            NodeCommand::Ping { node, route } => {
+                commands::node_ping(&state, node, route).await?;
             }
             NodeCommand::Rm { node } => {
                 commands::node_rm(&mut state, node).await?;
@@ -70,9 +71,22 @@ async fn main() -> Result<()> {
             to,
             name,
             port,
+            route,
             command,
         } => {
-            commands::deploy(&mut state, &paths, target, to, name, port, command).await?;
+            commands::deploy(
+                &mut state,
+                &paths,
+                commands::DeployArgs {
+                    target,
+                    to,
+                    name,
+                    port,
+                    route,
+                    command,
+                },
+            )
+            .await?;
         }
         Command::Services => {
             commands::services(&state).await?;
@@ -96,8 +110,19 @@ async fn main() -> Result<()> {
         Command::Rm { service } => {
             commands::rm(&mut state, service).await?;
         }
-        Command::Exec { node, command } => {
-            commands::exec(&mut state, node, command).await?;
+        Command::Exec {
+            node,
+            route,
+            command,
+        } => {
+            commands::exec(&mut state, node, route, command).await?;
+        }
+        Command::Proxy {
+            service,
+            listen,
+            route,
+        } => {
+            commands::proxy(&state, service, listen, route).await?;
         }
         Command::Open { service } => {
             commands::open(&state, service).await?;
@@ -132,6 +157,7 @@ async fn main() -> Result<()> {
 }
 
 mod commands {
+    use crate::cli::RouteMode;
     use crate::docker;
     use crate::model::{Mesh, Node, ServiceStatus};
     use crate::paths::ViaPaths;
@@ -164,6 +190,7 @@ mod commands {
                     display_name: host.clone(),
                     addresses: vec![host.clone()],
                     daemon_addr: format!("{host}:47819"),
+                    iroh_addr: None,
                     public: false,
                     created_at: now_ts(),
                     last_seen_at: Some(now_ts()),
@@ -193,6 +220,7 @@ mod commands {
             display_name: host.clone(),
             addresses: vec![host.clone()],
             daemon_addr: format!("{host}:47819"),
+            iroh_addr: None,
             public: false,
             created_at: now_ts(),
             last_seen_at: Some(now_ts()),
@@ -230,6 +258,11 @@ mod commands {
         let daemon_host = ssh::resolved_hostname(&ssh_host).unwrap_or_else(|_| ssh_host.clone());
         let daemon_addr = format!("{daemon_host}:47819");
         crate::rpc::wait_until_ready(&daemon_addr).await?;
+        let iroh_addr = match crate::rpc::call(&daemon_addr, crate::rpc::RpcRequest::NodeInfo).await
+        {
+            Ok(crate::rpc::RpcResponse::NodeInfo { iroh_addr }) => iroh_addr,
+            Ok(_) | Err(_) => existing.as_ref().and_then(|node| node.iroh_addr.clone()),
+        };
 
         let node = Node {
             id: node_id,
@@ -237,6 +270,7 @@ mod commands {
             display_name: ssh_host.clone(),
             addresses: vec![ssh_host],
             daemon_addr,
+            iroh_addr,
             public,
             created_at: now_ts(),
             last_seen_at: None,
@@ -319,7 +353,14 @@ mod commands {
                 let docker_ok = docker::local_docker_check().is_ok();
                 check(&format!("docker on {}", node.slug), docker_ok, &mut failed);
             } else {
-                let ping_ok = crate::rpc::ping(&node.daemon_addr).await.is_ok();
+                let ping_ok = crate::transport::call_node(
+                    state,
+                    &node,
+                    crate::rpc::RpcRequest::Ping,
+                    RouteMode::Auto,
+                )
+                .await
+                .is_ok();
                 check(
                     &format!("daemon {} {}", node.slug, node.daemon_addr),
                     ping_ok,
@@ -402,7 +443,7 @@ mod commands {
         Ok(())
     }
 
-    pub async fn node_ping(state: &ViaState, node_slug: String) -> Result<()> {
+    pub async fn node_ping(state: &ViaState, node_slug: String, route: RouteMode) -> Result<()> {
         let node = state
             .node_by_slug(&node_slug)
             .await?
@@ -411,8 +452,8 @@ mod commands {
             println!("Node '{}' is local.", node.slug);
             return Ok(());
         }
-        crate::rpc::ping(&node.daemon_addr).await?;
-        println!("Node '{}' is reachable at {}.", node.slug, node.daemon_addr);
+        crate::transport::call_node(state, &node, crate::rpc::RpcRequest::Ping, route).await?;
+        println!("Node '{}' is reachable via {:?}.", node.slug, route);
         Ok(())
     }
 
@@ -436,15 +477,24 @@ mod commands {
         Ok(())
     }
 
-    pub async fn deploy(
-        state: &mut ViaState,
-        paths: &ViaPaths,
-        target: String,
-        to: String,
-        name: String,
-        port: Option<String>,
-        command: Vec<String>,
-    ) -> Result<()> {
+    pub struct DeployArgs {
+        pub target: String,
+        pub to: String,
+        pub name: String,
+        pub port: Option<String>,
+        pub route: RouteMode,
+        pub command: Vec<String>,
+    }
+
+    pub async fn deploy(state: &mut ViaState, paths: &ViaPaths, args: DeployArgs) -> Result<()> {
+        let DeployArgs {
+            target,
+            to,
+            name,
+            port,
+            route,
+            command,
+        } = args;
         let node = state
             .node_by_slug(&to)
             .await?
@@ -466,8 +516,9 @@ mod commands {
         } else if node.last_seen_at.is_some() {
             docker::deploy_image(&node, &target, &container, port, &env, &command).await?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match crate::transport::call_node(
+                state,
+                &node,
                 crate::rpc::RpcRequest::DeployImage {
                     image: target,
                     service: service_name.clone(),
@@ -476,6 +527,7 @@ mod commands {
                     env,
                     command,
                 },
+                route,
             )
             .await?
             {
@@ -504,7 +556,7 @@ mod commands {
         for service in services {
             let service = resolve_service_node_addr(state, service).await?;
             let local = state.local_node().await?.id == service.node_id;
-            let actual = container_status(&service, local)
+            let actual = container_status(state, &service, local)
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
             println!(
@@ -587,7 +639,30 @@ mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         let service = resolve_service_node_addr(state, service).await?;
-        docker::logs(&service, local, follow).await
+        if local {
+            return docker::logs(&service, true, follow).await;
+        }
+        let node = state
+            .node_by_id(&service.node_id)
+            .await?
+            .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))?;
+        match crate::transport::call_node(
+            state,
+            &node,
+            crate::rpc::RpcRequest::Logs {
+                container: service.container,
+                follow,
+            },
+            RouteMode::Auto,
+        )
+        .await?
+        {
+            crate::rpc::RpcResponse::Logs { output } => {
+                print!("{output}");
+                Ok(())
+            }
+            other => bail!("unexpected logs response: {other:?}"),
+        }
     }
 
     pub async fn stop(state: &mut ViaState, service: String) -> Result<()> {
@@ -597,7 +672,23 @@ mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         service = resolve_service_node_addr(state, service).await?;
-        docker::stop(&service, local).await?;
+        if local {
+            docker::stop(&service, true).await?;
+        } else {
+            let node = state
+                .node_by_id(&service.node_id)
+                .await?
+                .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))?;
+            crate::transport::call_node(
+                state,
+                &node,
+                crate::rpc::RpcRequest::Stop {
+                    container: service.container.clone(),
+                },
+                RouteMode::Auto,
+            )
+            .await?;
+        }
         service.status = ServiceStatus::Stopped;
         service.updated_at = now_ts();
         state.upsert_service(&service).await?;
@@ -614,7 +705,23 @@ mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         service = resolve_service_node_addr(state, service).await?;
-        docker::restart(&service, local).await?;
+        if local {
+            docker::restart(&service, true).await?;
+        } else {
+            let node = state
+                .node_by_id(&service.node_id)
+                .await?
+                .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))?;
+            crate::transport::call_node(
+                state,
+                &node,
+                crate::rpc::RpcRequest::Restart {
+                    container: service.container.clone(),
+                },
+                RouteMode::Auto,
+            )
+            .await?;
+        }
         service.status = ServiceStatus::Running;
         service.updated_at = now_ts();
         state.upsert_service(&service).await?;
@@ -634,11 +741,17 @@ mod commands {
         if local {
             docker::local_remove(&service.container)?;
         } else {
-            crate::rpc::call(
-                &service.node_addr,
+            let node = state
+                .node_by_id(&service.node_id)
+                .await?
+                .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))?;
+            crate::transport::call_node(
+                state,
+                &node,
                 crate::rpc::RpcRequest::Remove {
                     container: service.container.clone(),
                 },
+                RouteMode::Auto,
             )
             .await?;
         }
@@ -650,7 +763,12 @@ mod commands {
         Ok(())
     }
 
-    pub async fn exec(state: &mut ViaState, node: String, command: Vec<String>) -> Result<()> {
+    pub async fn exec(
+        state: &mut ViaState,
+        node: String,
+        route: RouteMode,
+        command: Vec<String>,
+    ) -> Result<()> {
         let node = state
             .node_by_slug(&node)
             .await?
@@ -659,11 +777,13 @@ mod commands {
         let output = if local {
             crate::util::run_command_capture(&command)?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match crate::transport::call_node(
+                state,
+                &node,
                 crate::rpc::RpcRequest::Exec {
                     command: command.clone(),
                 },
+                route,
             )
             .await?
             {
@@ -685,6 +805,21 @@ mod commands {
         sync_all(state).await?;
         print!("{output}");
         Ok(())
+    }
+
+    pub async fn proxy(
+        state: &ViaState,
+        service: String,
+        listen: String,
+        route: RouteMode,
+    ) -> Result<()> {
+        let service = match state.service_by_name(&service).await? {
+            Some(service) => service,
+            None => service_from_via_url(state, &service)
+                .await?
+                .ok_or_else(|| anyhow!("unknown service"))?,
+        };
+        crate::transport::proxy_service(state, &service, &listen, route).await
     }
 
     pub async fn open(state: &ViaState, service: String) -> Result<()> {
@@ -744,7 +879,7 @@ mod commands {
         if all {
             let local_node = state.local_node().await?;
             for node in state.nodes().await? {
-                update_node(&node, node.id == local_node.id, &latest).await?;
+                update_node(state, &node, node.id == local_node.id, &latest).await?;
             }
         } else if let Some(node_slug) = node {
             let node = state
@@ -752,7 +887,7 @@ mod commands {
                 .await?
                 .ok_or_else(|| anyhow!("unknown node '{node_slug}'"))?;
             let local = state.local_node().await?.id == node.id;
-            update_node(&node, local, &latest).await?;
+            update_node(state, &node, local, &latest).await?;
         } else {
             update_local(&latest)?;
         }
@@ -785,13 +920,14 @@ mod commands {
         }
     }
 
-    async fn update_node(node: &Node, local: bool, version: &str) -> Result<()> {
+    async fn update_node(state: &ViaState, node: &Node, local: bool, version: &str) -> Result<()> {
         println!("Updating '{}' to {}...", node.slug, version);
         let output = if local {
             run_update_installer(version)?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match crate::transport::call_node(
+                state,
+                node,
                 crate::rpc::RpcRequest::Exec {
                     command: vec![
                         "sh".to_string(),
@@ -799,6 +935,7 @@ mod commands {
                         update_shell_command(version),
                     ],
                 },
+                RouteMode::Auto,
             )
             .await?
             {
@@ -992,11 +1129,13 @@ mod commands {
             if node.last_seen_at.is_some() {
                 continue;
             }
-            if let Err(error) = crate::rpc::call(
-                &node.daemon_addr,
+            if let Err(error) = crate::transport::call_node(
+                state,
+                node,
                 crate::rpc::RpcRequest::ImportSnapshot {
                     snapshot: snapshot.clone(),
                 },
+                RouteMode::Auto,
             )
             .await
             {
@@ -1018,15 +1157,38 @@ mod commands {
         Ok(service)
     }
 
-    async fn container_status(service: &crate::model::Service, local: bool) -> Result<String> {
+    async fn service_from_via_url(
+        state: &ViaState,
+        value: &str,
+    ) -> Result<Option<crate::model::Service>> {
+        let Some(rest) = value.strip_prefix("via://") else {
+            return Ok(None);
+        };
+        let Some((_node, service)) = rest.split_once('/') else {
+            bail!("via URLs must look like via://node/service");
+        };
+        state.service_by_name(service).await
+    }
+
+    async fn container_status(
+        state: &ViaState,
+        service: &crate::model::Service,
+        local: bool,
+    ) -> Result<String> {
         if local {
             return docker::local_container_status(&service.container);
         }
-        match crate::rpc::call(
-            &service.node_addr,
+        let node = state
+            .node_by_id(&service.node_id)
+            .await?
+            .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))?;
+        match crate::transport::call_node(
+            state,
+            &node,
             crate::rpc::RpcRequest::ContainerStatus {
                 container: service.container.clone(),
             },
+            RouteMode::Auto,
         )
         .await?
         {

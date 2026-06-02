@@ -232,6 +232,7 @@ impl ViaState {
                     node.last_seen_at = existing.last_seen_at;
                     node.daemon_addr = existing.daemon_addr;
                     node.addresses = existing.addresses;
+                    node.iroh_addr = existing.iroh_addr;
                 }
             } else {
                 node.last_seen_at = None;
@@ -433,6 +434,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -449,6 +451,7 @@ mod tests {
                 display_name: "rig".to_string(),
                 addresses: vec!["rig".to_string()],
                 daemon_addr: "rig:47819".to_string(),
+                iroh_addr: None,
                 public: false,
                 created_at: 1,
                 last_seen_at: None,
@@ -470,6 +473,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -484,6 +488,7 @@ mod tests {
                     display_name: "pi".to_string(),
                     addresses: vec!["pi.local".to_string()],
                     daemon_addr: "pi.local:47819".to_string(),
+                    iroh_addr: None,
                     public: false,
                     created_at: 1,
                     last_seen_at: None,
@@ -509,6 +514,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths.clone()).await.unwrap();
         state
@@ -538,6 +544,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -573,6 +580,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -603,6 +611,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -636,6 +645,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -673,6 +683,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state

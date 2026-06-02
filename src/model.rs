@@ -13,6 +13,8 @@ pub struct Node {
     pub display_name: String,
     pub addresses: Vec<String>,
     pub daemon_addr: String,
+    #[serde(default)]
+    pub iroh_addr: Option<String>,
     pub public: bool,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,

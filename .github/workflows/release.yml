@@ -129,6 +129,21 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          prerelease="false"
+          if [[ "$tag" == *"-alpha"* || "$tag" == *"-beta"* || "$tag" == *"-rc"* ]]; then
+            prerelease="true"
+          fi
+          {
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -138,5 +153,7 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
           files: dist/*
           generate_release_notes: true

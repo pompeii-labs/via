@@ -179,6 +179,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
 
         ensure_mesh_key(&paths).unwrap();

@@ -10,17 +10,64 @@ use tokio::net::TcpListener;
 pub async fn run(bind: String, paths: ViaPaths) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     let addr = listener.local_addr()?;
-    println!("via daemon listening on {addr}");
     let mut state = ViaState::open(paths).await?;
     let paths = state.paths().clone();
+    let iroh_endpoint = crate::transport::endpoint(&paths).await?;
+    crate::transport::update_local_iroh_addr(&mut state, &iroh_endpoint).await?;
+    println!(
+        "via daemon listening on {addr} and iroh {}",
+        iroh_endpoint.id()
+    );
     let mut seen_nonces = HashSet::new();
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        if let Err(error) = handle_connection(&mut state, &paths, &mut seen_nonces, socket).await {
-            eprintln!("via daemon request failed: {error}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                if let Err(error) = handle_connection(&mut state, &paths, &mut seen_nonces, socket).await {
+                    eprintln!("via daemon request failed: {error}");
+                }
+            }
+            incoming = iroh_endpoint.accept() => {
+                let Some(connecting) = incoming else {
+                    break;
+                };
+                match connecting.await {
+                    Ok(conn) if conn.alpn() == crate::transport::RPC_ALPN => {
+                        if let Err(error) = crate::transport::handle_rpc_connection(
+                            &mut state,
+                            &paths,
+                            &mut seen_nonces,
+                            conn,
+                        ).await {
+                            eprintln!("via iroh rpc failed: {error}");
+                        }
+                    }
+                    Ok(conn) if conn.alpn() == crate::transport::PROXY_ALPN => {
+                        match crate::transport::authorize_iroh_peer(&state, &conn).await {
+                            Ok(()) => {
+                                tokio::spawn(async move {
+                                    if let Err(error) = crate::transport::handle_proxy_connection(conn).await {
+                                        eprintln!("via iroh proxy failed: {error}");
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                conn.close(0u8.into(), error.to_string().as_bytes());
+                                eprintln!("via iroh proxy rejected: {error}");
+                            }
+                        }
+                    }
+                    Ok(conn) => {
+                        conn.close(0u8.into(), b"unsupported via alpn");
+                    }
+                    Err(error) => eprintln!("via iroh connection failed: {error}"),
+                }
+            }
         }
     }
+    iroh_endpoint.close().await;
+    Ok(())
 }
 
 async fn handle_connection(
@@ -32,7 +79,23 @@ async fn handle_connection(
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    let response = match crate::rpc::verify_request(paths, &line) {
+    let response = handle_rpc_line(state, paths, seen_nonces, &line).await?;
+
+    let mut socket = reader.into_inner();
+    socket
+        .write_all(&crate::rpc::encode_response(paths, &response)?)
+        .await?;
+    socket.write_all(b"\n").await?;
+    Ok(())
+}
+
+pub async fn handle_rpc_line(
+    state: &mut ViaState,
+    paths: &ViaPaths,
+    seen_nonces: &mut HashSet<String>,
+    line: &str,
+) -> Result<RpcResponse> {
+    let response = match crate::rpc::verify_request(paths, line) {
         Ok(verified) => match verified.nonce {
             Some(nonce) => {
                 if !seen_nonces.insert(nonce) {
@@ -59,18 +122,18 @@ async fn handle_connection(
             message: error.to_string(),
         },
     };
-
-    let mut socket = reader.into_inner();
-    socket
-        .write_all(&crate::rpc::encode_response(paths, &response)?)
-        .await?;
-    socket.write_all(b"\n").await?;
-    Ok(())
+    Ok(response)
 }
 
 async fn handle_request(state: &mut ViaState, request: RpcRequest) -> Result<RpcResponse> {
     match request {
         RpcRequest::Ping => Ok(RpcResponse::Pong),
+        RpcRequest::NodeInfo => {
+            let local = state.local_node().await?;
+            Ok(RpcResponse::NodeInfo {
+                iroh_addr: local.iroh_addr,
+            })
+        }
         RpcRequest::ExportSnapshot => Ok(RpcResponse::Snapshot {
             snapshot: state.snapshot().await?,
         }),
@@ -152,6 +215,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = std_listener.local_addr().unwrap();
@@ -195,6 +259,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         };
         crate::security::ensure_mesh_key(&paths).unwrap();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

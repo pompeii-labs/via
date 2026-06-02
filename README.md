@@ -85,7 +85,12 @@ A secret is encrypted at rest with the mesh key and synced through mesh state. D
 
 ## Network Model
 
-Use Via on machines reachable over a private network: LAN, Tailscale, WireGuard, or a similar overlay.
+Via uses two private routes between nodes:
+
+- direct TCP to the daemon address, preferred for LAN/local networks
+- Iroh peer-to-peer QUIC, used when direct TCP is unavailable
+
+Iroh gives each Via node a persistent cryptographic identity in `~/.via/iroh.key`. Via stores the node's current Iroh endpoint address in mesh state and uses it for off-LAN RPC and private service proxying. Iroh attempts direct connectivity and can fall back to its relay network when NAT prevents a direct path.
 
 Via daemons are not meant to be exposed directly to the public internet. Treat daemon reachability as administrative reachability.
 
@@ -149,6 +154,7 @@ Check the mesh:
 via doctor
 via nodes
 via node ping rig
+via node ping rig --route iroh
 ```
 
 ## Daily Operations
@@ -157,6 +163,7 @@ Run a command on a node:
 
 ```bash
 via exec rig -- sh -lc 'hostname && uptime'
+via exec rig --route iroh -- uptime
 ```
 
 Inspect services:
@@ -166,6 +173,7 @@ via ps
 via services
 via status web
 via open web
+via proxy web --listen 127.0.0.1:18080
 ```
 
 Read logs:
@@ -221,14 +229,18 @@ Updating installs the new binary. Restart running daemons after updating so long
 | `via daemon` | Run the daemon in the foreground. |
 | `via doctor` | Check local state, mesh key, Docker, and node daemon reachability. |
 | `via nodes` | List mesh nodes. |
-| `via node ping rig` | Check one node daemon. |
+| `via node ping rig` | Check one node daemon using direct TCP first, then Iroh. |
+| `via node ping rig --route iroh` | Force the Iroh route for a node check. |
 | `via exec rig -- <cmd>` | Run a command on a node through Via RPC. |
+| `via exec rig --route iroh -- <cmd>` | Force node exec over Iroh. |
 | `via deploy <image> --to rig --name web` | Deploy a Docker image. |
+| `via deploy <image> --to rig --name web --route iroh` | Force remote deploy RPC over Iroh. |
 | `via ps` | Show services with live container status. |
 | `via services` | Show recorded service state. |
 | `via logs web` | Read service logs. |
 | `via logs` | Read Via audit/system events. |
 | `via open web` | Print the local/private URL for a port-mapped service. |
+| `via proxy web --listen 127.0.0.1:18080` | Proxy a service through Via, using Iroh when needed. |
 | `via rm web` | Remove a service and its container. |
 | `via secret set KEY --value value` | Store an encrypted mesh secret. |
 | `via update --all` | Install the current/latest Via release across reachable nodes. |
@@ -311,6 +323,21 @@ Releases are tag-based:
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+Prereleases use the same workflow and assets, but are marked as GitHub prereleases when the tag contains `-alpha`, `-beta`, or `-rc`:
+
+```bash
+git tag v0.2.0-alpha.1
+git push origin v0.2.0-alpha.1
+```
+
+Install a prerelease explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.2.0-alpha.1
+```
+
+`latest` installs continue to resolve only stable GitHub releases, not prereleases.
 
 The release workflow is:
 

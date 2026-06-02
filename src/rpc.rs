@@ -7,10 +7,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
     Ping,
+    NodeInfo,
     ExportSnapshot,
     ImportSnapshot {
         snapshot: MeshSnapshot,
@@ -60,11 +61,12 @@ pub struct VerifiedRpcRequest {
     pub nonce: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
     Ok,
     Pong,
+    NodeInfo { iroh_addr: Option<String> },
     Snapshot { snapshot: MeshSnapshot },
     Service { service: Service },
     ContainerStatus { status: String },
@@ -242,6 +244,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            iroh_key: temp.path().join("iroh.key"),
         }
     }
 

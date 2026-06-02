@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 getrandom = "0.2"
 hmac = "0.12"
+iroh = "0.98.2"
 lux = { git = "https://github.com/lux-db/lux.git", tag = "v0.13.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
