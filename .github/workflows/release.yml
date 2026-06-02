@@ -99,6 +99,17 @@ jobs:
           key: ${{ matrix.target }}
           workspaces: Pompeii/via
 
+      - name: Verify release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "via") | .version')"
+          if [[ "$tag" != "$version" ]]; then
+            echo "release tag v$tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
       - name: Build Linux
         if: contains(matrix.target, 'linux-musl')
         run: CC=musl-gcc cargo build --locked --release --target "${{ matrix.target }}"

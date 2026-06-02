@@ -320,8 +320,8 @@ The workflow is:
 Releases are tag-based:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Prereleases use the same workflow and assets, but are marked as GitHub prereleases when the tag contains `-alpha`, `-beta`, or `-rc`:

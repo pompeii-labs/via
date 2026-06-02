@@ -148,4 +148,9 @@ fi
 install -m 755 "$tmp/$APP_NAME" "$INSTALL_DIR/$APP_NAME"
 update_path
 
-echo "installed $APP_NAME $version to $INSTALL_DIR/$APP_NAME"
+installed_version="$("$INSTALL_DIR/$APP_NAME" --version 2>/dev/null || true)"
+if [ -n "$installed_version" ]; then
+  echo "installed $installed_version to $INSTALL_DIR/$APP_NAME"
+else
+  echo "installed $APP_NAME $version to $INSTALL_DIR/$APP_NAME"
+fi
