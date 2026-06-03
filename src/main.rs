@@ -1,3 +1,4 @@
+mod auth;
 mod cli;
 mod daemon;
 mod docker;
@@ -12,7 +13,7 @@ mod util;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, HubCommand, InviteCommand, NodeCommand, SecretCommand};
+use cli::{AuthCommand, Cli, Command, HubCommand, InviteCommand, NodeCommand, SecretCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,6 +43,12 @@ async fn main() -> Result<()> {
         }
         Command::Join { token, name } => {
             hub::join(&paths, name.clone(), token.clone()).await?;
+            return Ok(());
+        }
+        Command::Auth {
+            command: AuthCommand::Init,
+        } => {
+            auth::init(&paths)?;
             return Ok(());
         }
         _ => {}
@@ -97,6 +104,7 @@ async fn main() -> Result<()> {
             }
         },
         Command::Join { .. } => unreachable!("join is handled before state initialization"),
+        Command::Auth { .. } => unreachable!("auth is handled before state initialization"),
         Command::Node { command } => match command {
             NodeCommand::Rename { old, new } => {
                 commands::rename_node(&mut state, old, new).await?;

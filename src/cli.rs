@@ -36,6 +36,10 @@ pub enum Command {
         #[command(subcommand)]
         command: HubCommand,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Invite {
         #[command(subcommand)]
         command: InviteCommand,
@@ -162,6 +166,11 @@ pub enum HubCommand {
         #[arg(long)]
         lux_dir: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    Init,
 }
 
 #[derive(Debug, Subcommand)]
