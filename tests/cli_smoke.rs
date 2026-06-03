@@ -1,5 +1,7 @@
 use std::process::Command;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[test]
 fn version_flag_reports_package_version() {
     let via = env!("CARGO_BIN_EXE_via");
@@ -13,7 +15,7 @@ fn version_flag_reports_package_version() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("via 0.2.0-alpha.1"),
+        stdout.contains(&format!("via {VERSION}")),
         "unexpected stdout: {stdout}"
     );
 }
@@ -37,7 +39,7 @@ fn update_check_reports_available_version() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("current: 0.2.0-alpha.1"),
+        stdout.contains(&format!("current: {VERSION}")),
         "unexpected stdout: {stdout}"
     );
     assert!(

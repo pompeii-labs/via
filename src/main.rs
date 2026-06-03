@@ -400,7 +400,33 @@ pub(crate) mod commands {
     }
 
     pub async fn nodes(state: &ViaState) -> Result<()> {
-        let nodes = state.nodes().await?;
+        let mut nodes = state.nodes().await?;
+        if crate::hub::configured(state.paths()) {
+            match crate::hub::nodes(state).await {
+                Ok(hub_nodes) => {
+                    for hub_node in hub_nodes {
+                        if !nodes.iter().any(|node| node.slug == hub_node.slug) {
+                            nodes.push(Node {
+                                id: hub_node.id,
+                                slug: hub_node.slug.clone(),
+                                display_name: hub_node.name,
+                                addresses: vec!["hub".to_string()],
+                                daemon_addr: String::new(),
+                                public: false,
+                                created_at: hub_node.seen,
+                                last_seen_at: if hub_node.status == "online" {
+                                    Some(hub_node.seen)
+                                } else {
+                                    None
+                                },
+                            });
+                        }
+                    }
+                    nodes.sort_by(|a, b| a.slug.cmp(&b.slug));
+                }
+                Err(error) => eprintln!("warning: failed to read hub nodes: {error}"),
+            }
+        }
         if nodes.is_empty() {
             println!("No nodes. Run `via init` first.");
             return Ok(());
@@ -461,10 +487,7 @@ pub(crate) mod commands {
     }
 
     pub async fn node_ping(state: &ViaState, node_slug: String, route: RouteMode) -> Result<()> {
-        let node = state
-            .node_by_slug(&node_slug)
-            .await?
-            .ok_or_else(|| anyhow!("unknown node '{node_slug}'"))?;
+        let node = resolve_node_for_route(state, &node_slug, route).await?;
         if state.local_node().await?.id == node.id {
             println!("Node '{}' is local.", node.slug);
             return Ok(());
@@ -733,10 +756,7 @@ pub(crate) mod commands {
         route: RouteMode,
         command: Vec<String>,
     ) -> Result<()> {
-        let node = state
-            .node_by_slug(&node)
-            .await?
-            .ok_or_else(|| anyhow!("unknown node '{node}'"))?;
+        let node = resolve_node_for_route(state, &node, route).await?;
         let local = state.local_node().await?.id == node.id;
         let output = if local {
             crate::util::run_command_capture(&command)?
@@ -1114,6 +1134,24 @@ pub(crate) mod commands {
                 Err(error) => Err(error),
             },
         }
+    }
+
+    async fn resolve_node_for_route(
+        state: &ViaState,
+        slug: &str,
+        route: RouteMode,
+    ) -> Result<Node> {
+        if let Some(node) = state.node_by_slug(slug).await? {
+            return Ok(node);
+        }
+        if matches!(route, RouteMode::Hub | RouteMode::Auto)
+            && crate::hub::configured(state.paths())
+        {
+            if let Some(node) = crate::hub::node_by_slug(state, slug).await? {
+                return Ok(node);
+            }
+        }
+        bail!("unknown node '{slug}'")
     }
 
     async fn resolve_service_node_addr(

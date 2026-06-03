@@ -6,14 +6,14 @@ use crate::util::now_ts;
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use lux::{EmbeddedClient, ServerConfig, ServerHandle};
+use lux::{EmbeddedClient, EmbeddedValue, ServerConfig, ServerHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -28,6 +28,7 @@ use url::Url;
 use uuid::Uuid;
 
 const INIT_HUB: &str = include_str!("../lux/migrations/20260602000000_init_hub.lux");
+const ADMIN_TOKEN_ENV: &str = "VIA_HUB_ADMIN_TOKEN";
 const TABLES: &[&str] = &[
     "meshes", "nodes", "tokens", "sessions", "cmds", "events", "audit",
 ];
@@ -90,6 +91,42 @@ struct CreateTokenRequest {
     exp: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct RegisterNodeRequest {
+    mesh: String,
+    node: String,
+    slug: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JoinRequest {
+    mesh: String,
+    node: String,
+    slug: String,
+    token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthResponse {
+    token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NodesQuery {
+    mesh: String,
+    node: String,
+    token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HubNode {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub status: String,
+    pub seen: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PostCmdRequest {
     pub mesh: String,
@@ -111,6 +148,7 @@ type SessionKey = (String, String);
 
 struct HubRuntime {
     db: HubDb,
+    admin_token: Option<String>,
     sessions: Mutex<HashMap<SessionKey, mpsc::Sender<HubToAgent>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     results: Mutex<HashMap<String, CmdResponse>>,
@@ -138,24 +176,40 @@ pub fn save_config(paths: &ViaPaths, config: &HubConfig) -> Result<()> {
 
 pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<()> {
     let url = normalize_http_url(&url)?;
-    save_config(
-        paths,
-        &HubConfig {
-            url: url.clone(),
-            token: load_config(paths)?.and_then(|config| config.token),
-        },
-    )?;
+    let mut token = load_config(paths)?.and_then(|config| config.token);
     if let Some(mesh) = state.mesh().await? {
+        let local = state.local_node().await?;
         let client = reqwest::Client::new();
-        let _ = client
-            .post(format!("{url}/v1/meshes"))
+        admin_request(client.post(format!("{url}/v1/meshes")))
             .json(&CreateMeshRequest {
                 id: mesh.id,
                 name: "default".to_string(),
             })
             .send()
-            .await;
+            .await?
+            .error_for_status()?;
+        if token.is_none() {
+            let response = admin_request(client.post(format!("{url}/v1/nodes/register")))
+                .json(&RegisterNodeRequest {
+                    mesh: state.mesh().await?.expect("mesh checked above").id,
+                    node: local.id,
+                    slug: local.slug,
+                })
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<AuthResponse>()
+                .await?;
+            token = Some(response.token);
+        }
     }
+    save_config(
+        paths,
+        &HubConfig {
+            url: url.clone(),
+            token,
+        },
+    )?;
     println!("Via hub set to {url}.");
     Ok(())
 }
@@ -186,8 +240,7 @@ pub async fn create_invite(
     };
 
     let client = reqwest::Client::new();
-    client
-        .post(format!("{}/v1/meshes", config.url))
+    admin_request(client.post(format!("{}/v1/meshes", config.url)))
         .json(&CreateMeshRequest {
             id: mesh.id.clone(),
             name: "default".to_string(),
@@ -195,8 +248,7 @@ pub async fn create_invite(
         .send()
         .await?
         .error_for_status()?;
-    client
-        .post(format!("{}/v1/tokens", config.url))
+    admin_request(client.post(format!("{}/v1/tokens", config.url)))
         .json(&CreateTokenRequest {
             mesh: mesh.id,
             name,
@@ -218,23 +270,35 @@ pub async fn join(paths: &ViaPaths, name: Option<String>, token: String) -> Resu
     if invite.exp < now_ts() {
         bail!("invite token expired");
     }
+    let node_name = name
+        .or_else(|| invite.name.clone())
+        .unwrap_or_else(|| local_hostname().unwrap_or_else(|_| "node".to_string()));
+    let slug = crate::util::normalize_slug(&node_name)?;
+    let mesh_id = invite.mesh.clone();
+    let node_id = Uuid::new_v4().to_string();
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/join", invite.hub))
+        .json(&JoinRequest {
+            mesh: mesh_id.clone(),
+            node: node_id.clone(),
+            slug,
+            token: invite.token,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<AuthResponse>()
+        .await?;
     crate::security::install_mesh_key(paths, &invite.key)?;
     save_config(
         paths,
         &HubConfig {
-            url: invite.hub.clone(),
-            token: Some(invite.token),
+            url: invite.hub,
+            token: Some(response.token),
         },
     )?;
     let mut state = ViaState::open(paths.clone()).await?;
-    let node_name = name.or(invite.name);
-    crate::commands::init(
-        &mut state,
-        node_name,
-        Some(invite.mesh),
-        Some(Uuid::new_v4().to_string()),
-    )
-    .await?;
+    crate::commands::init(&mut state, Some(node_name), Some(mesh_id), Some(node_id)).await?;
     state.shutdown().await?;
     Ok(())
 }
@@ -272,6 +336,53 @@ pub async fn call_node(state: &ViaState, node: &Node, request: RpcRequest) -> Re
     crate::rpc::decode_response(state.paths(), &res)
 }
 
+pub async fn nodes(state: &ViaState) -> Result<Vec<HubNode>> {
+    let config =
+        load_config(state.paths())?.ok_or_else(|| anyhow!("run `via hub use <url>` first"))?;
+    let token = config
+        .token
+        .ok_or_else(|| anyhow!("hub is configured but missing a node token"))?;
+    let mesh = state
+        .mesh()
+        .await?
+        .ok_or_else(|| anyhow!("run `via init` first"))?;
+    let local = state.local_node().await?;
+    let client = reqwest::Client::new();
+    Ok(client
+        .get(format!("{}/v1/nodes", config.url))
+        .query(&NodesQuery {
+            mesh: mesh.id,
+            node: local.slug,
+            token,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<HubNode>>()
+        .await?)
+}
+
+pub async fn node_by_slug(state: &ViaState, slug: &str) -> Result<Option<Node>> {
+    Ok(nodes(state)
+        .await?
+        .into_iter()
+        .find(|node| node.slug == slug)
+        .map(|node| Node {
+            id: node.id,
+            slug: node.slug.clone(),
+            display_name: node.name,
+            addresses: Vec::new(),
+            daemon_addr: String::new(),
+            public: false,
+            created_at: node.seen,
+            last_seen_at: if node.status == "online" {
+                Some(node.seen)
+            } else {
+                None
+            },
+        }))
+}
+
 pub fn spawn_agent(paths: ViaPaths, mesh: Mesh, node: Node) -> Option<mpsc::Receiver<HubAgentRpc>> {
     let config = match load_config(&paths) {
         Ok(Some(config)) => config,
@@ -295,6 +406,9 @@ pub async fn start(bind: String, lux_dir: Option<String>, migrate: bool) -> Resu
     }
     let runtime = Arc::new(HubRuntime {
         db,
+        admin_token: std::env::var(ADMIN_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty()),
         sessions: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
@@ -304,6 +418,9 @@ pub async fn start(bind: String, lux_dir: Option<String>, migrate: bool) -> Resu
         .route("/v1/agent/connect", get(agent_connect))
         .route("/v1/meshes", post(create_mesh))
         .route("/v1/tokens", post(create_token))
+        .route("/v1/join", post(join_mesh))
+        .route("/v1/nodes", get(list_nodes))
+        .route("/v1/nodes/register", post(register_node))
         .route("/v1/cmds", post(post_cmd))
         .route("/v1/cmds/{id}", get(get_cmd))
         .with_state(runtime);
@@ -325,8 +442,12 @@ async fn health() -> &'static str {
 
 async fn create_mesh(
     State(runtime): State<Arc<HubRuntime>>,
+    headers: HeaderMap,
     Json(req): Json<CreateMeshRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = require_admin(&runtime, &headers) {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
     match runtime.db.insert_mesh(&req.id, &req.name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
@@ -335,14 +456,67 @@ async fn create_mesh(
 
 async fn create_token(
     State(runtime): State<Arc<HubRuntime>>,
+    headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = require_admin(&runtime, &headers) {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
     match runtime
         .db
-        .insert_token(&req.mesh, req.name.as_deref(), &req.token, req.exp)
+        .insert_invite_token(&req.mesh, req.name.as_deref(), &req.token, req.exp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn register_node(
+    State(runtime): State<Arc<HubRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterNodeRequest>,
+) -> impl IntoResponse {
+    if let Err(error) = require_admin(&runtime, &headers) {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
+    match runtime
+        .db
+        .register_node(&req.mesh, &req.node, &req.slug)
+        .await
+    {
+        Ok(token) => Json(AuthResponse { token }).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn join_mesh(
+    State(runtime): State<Arc<HubRuntime>>,
+    Json(req): Json<JoinRequest>,
+) -> impl IntoResponse {
+    match runtime
+        .db
+        .claim_invite(&req.mesh, &req.node, &req.slug, &req.token)
+        .await
+    {
+        Ok(token) => Json(AuthResponse { token }).into_response(),
+        Err(error) => (StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
+    }
+}
+
+async fn list_nodes(
+    State(runtime): State<Arc<HubRuntime>>,
+    Query(query): Query<NodesQuery>,
+) -> impl IntoResponse {
+    if let Err(error) = runtime
+        .db
+        .validate_node_token(&query.mesh, &query.node, &query.token)
+        .await
+    {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
+    match runtime.db.nodes(&query.mesh).await {
+        Ok(nodes) => Json(nodes).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
@@ -352,7 +526,18 @@ async fn agent_connect(
     State(runtime): State<Arc<HubRuntime>>,
     Query(query): Query<AgentQuery>,
 ) -> impl IntoResponse {
+    let Some(token) = query.token.as_deref() else {
+        return (StatusCode::UNAUTHORIZED, "missing hub token").into_response();
+    };
+    if let Err(error) = runtime
+        .db
+        .validate_node_token(&query.mesh, &query.slug, token)
+        .await
+    {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
     ws.on_upgrade(move |socket| handle_agent(socket, runtime, query))
+        .into_response()
 }
 
 async fn post_cmd(
@@ -360,6 +545,16 @@ async fn post_cmd(
     Json(req): Json<PostCmdRequest>,
 ) -> impl IntoResponse {
     let id = Uuid::new_v4().to_string();
+    let Some(token) = req.token.as_deref() else {
+        return (StatusCode::UNAUTHORIZED, "missing hub token").into_response();
+    };
+    if let Err(error) = runtime
+        .db
+        .validate_node_token(&req.mesh, &req.src, token)
+        .await
+    {
+        return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
+    }
     if let Err(error) = runtime.db.insert_cmd(&id, &req).await {
         return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
     }
@@ -569,6 +764,40 @@ fn hash_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+fn local_hostname() -> Result<String> {
+    let output = std::process::Command::new("hostname")
+        .output()
+        .context("failed to read hostname")?;
+    if !output.status.success() {
+        bail!("hostname command failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn admin_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var(ADMIN_TOKEN_ENV) {
+        Ok(token) if !token.is_empty() => builder.bearer_auth(token),
+        _ => builder,
+    }
+}
+
+fn require_admin(runtime: &HubRuntime, headers: &HeaderMap) -> Result<()> {
+    let Some(expected) = runtime.admin_token.as_deref() else {
+        return Ok(());
+    };
+    let Some(header) = headers.get(axum::http::header::AUTHORIZATION) else {
+        bail!("missing admin token");
+    };
+    let raw = header.to_str().context("invalid authorization header")?;
+    let Some(actual) = raw.strip_prefix("Bearer ") else {
+        bail!("invalid admin token");
+    };
+    if actual != expected {
+        bail!("invalid admin token");
+    }
+    Ok(())
+}
+
 struct HubDb {
     _handle: ServerHandle,
     client: EmbeddedClient,
@@ -649,7 +878,7 @@ impl HubDb {
         .await
     }
 
-    async fn insert_token(
+    async fn insert_invite_token(
         &self,
         mesh: &str,
         name: Option<&str>,
@@ -666,6 +895,8 @@ impl HubDb {
                 ("id", &id),
                 ("mesh", mesh),
                 ("hash", &hash),
+                ("kind", "invite"),
+                ("node", ""),
                 ("name", name.unwrap_or("")),
                 ("exp", &exp),
                 ("used", "false"),
@@ -675,15 +906,108 @@ impl HubDb {
         .await
     }
 
+    async fn register_node(&self, mesh: &str, node: &str, slug: &str) -> Result<String> {
+        self.insert_node_record(mesh, node, slug).await?;
+        self.create_node_token(mesh, slug).await
+    }
+
+    async fn claim_invite(
+        &self,
+        mesh: &str,
+        node: &str,
+        slug: &str,
+        token: &str,
+    ) -> Result<String> {
+        let hash = hash_token(token);
+        let row = self
+            .token_by_hash(&hash)
+            .await?
+            .ok_or_else(|| anyhow!("invalid invite token"))?;
+        require_field(&row, "mesh", mesh)?;
+        require_field(&row, "kind", "invite")?;
+        if field(&row, "used").is_some_and(|used| used == "true") {
+            bail!("invite token has already been used");
+        }
+        let exp = field(&row, "exp")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if exp > 0 && exp < now_ts() {
+            bail!("invite token expired");
+        }
+        self.client
+            .execute(
+                "TUPDATE",
+                &[
+                    "tokens", "SET", "used", "true", "node", slug, "WHERE", "hash", "=", &hash,
+                ],
+            )
+            .await?;
+        self.insert_node_record(mesh, node, slug).await?;
+        self.create_node_token(mesh, slug).await
+    }
+
+    async fn validate_node_token(&self, mesh: &str, node: &str, token: &str) -> Result<()> {
+        let row = self
+            .token_by_hash(&hash_token(token))
+            .await?
+            .ok_or_else(|| anyhow!("invalid hub token"))?;
+        require_field(&row, "mesh", mesh)?;
+        require_field(&row, "kind", "node")?;
+        require_field(&row, "node", node)?;
+        let exp = field(&row, "exp")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if exp > 0 && exp < now_ts() {
+            bail!("hub token expired");
+        }
+        Ok(())
+    }
+
+    async fn create_node_token(&self, mesh: &str, slug: &str) -> Result<String> {
+        let token = crate::security::nonce()?;
+        let id = Uuid::new_v4().to_string();
+        let created = now_ts().to_string();
+        let hash = hash_token(&token);
+        self.insert_ignore(
+            "tokens",
+            &[
+                ("id", &id),
+                ("mesh", mesh),
+                ("hash", &hash),
+                ("kind", "node"),
+                ("node", slug),
+                ("name", slug),
+                ("exp", "0"),
+                ("used", "false"),
+                ("created", &created),
+            ],
+        )
+        .await?;
+        Ok(token)
+    }
+
+    async fn token_by_hash(&self, hash: &str) -> Result<Option<HashMap<String, String>>> {
+        Ok(self
+            .select_rows("tokens", &["WHERE", "hash", "=", hash, "LIMIT", "1"])
+            .await?
+            .into_iter()
+            .next())
+    }
+
     async fn insert_node(&self, query: &AgentQuery) -> Result<()> {
+        self.insert_node_record(&query.mesh, &query.node, &query.slug)
+            .await
+    }
+
+    async fn insert_node_record(&self, mesh: &str, node: &str, slug: &str) -> Result<()> {
         let seen = now_ts().to_string();
         self.insert_ignore(
             "nodes",
             &[
-                ("id", &query.node),
-                ("mesh", &query.mesh),
-                ("name", &query.slug),
-                ("slug", &query.slug),
+                ("id", node),
+                ("mesh", mesh),
+                ("name", slug),
+                ("slug", slug),
                 ("os", std::env::consts::OS),
                 ("arch", std::env::consts::ARCH),
                 ("ver", env!("CARGO_PKG_VERSION")),
@@ -692,6 +1016,25 @@ impl HubDb {
             ],
         )
         .await
+    }
+
+    async fn nodes(&self, mesh: &str) -> Result<Vec<HubNode>> {
+        let rows = self
+            .select_rows("nodes", &["WHERE", "mesh", "=", mesh])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| HubNode {
+                id: field(&row, "id").unwrap_or_default().to_string(),
+                slug: field(&row, "slug").unwrap_or_default().to_string(),
+                name: field(&row, "name").unwrap_or_default().to_string(),
+                status: field(&row, "status").unwrap_or("unknown").to_string(),
+                seen: field(&row, "seen")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0),
+            })
+            .filter(|node| !node.slug.is_empty())
+            .collect())
     }
 
     async fn insert_session(&self, id: &str, query: &AgentQuery) -> Result<()> {
@@ -780,6 +1123,52 @@ impl HubDb {
             Err(error) => Err(error.into()),
         }
     }
+
+    async fn select_rows(
+        &self,
+        table: &str,
+        suffix: &[&str],
+    ) -> Result<Vec<HashMap<String, String>>> {
+        let mut args = Vec::with_capacity(3 + suffix.len());
+        args.extend(["*", "FROM", table]);
+        args.extend(suffix.iter().copied());
+        match self.client.execute_value("TSELECT", &args).await? {
+            EmbeddedValue::Array(rows) => rows.into_iter().map(row_to_map).collect(),
+            other => Err(anyhow!("unexpected Lux table response: {other:?}")),
+        }
+    }
+}
+
+fn row_to_map(value: EmbeddedValue) -> Result<HashMap<String, String>> {
+    let EmbeddedValue::Array(values) = value else {
+        bail!("unexpected Lux table row: {value:?}");
+    };
+    let mut row = HashMap::new();
+    let mut iter = values.into_iter();
+    while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+        row.insert(embedded_to_string(key)?, embedded_to_string(value)?);
+    }
+    Ok(row)
+}
+
+fn embedded_to_string(value: EmbeddedValue) -> Result<String> {
+    match value {
+        EmbeddedValue::Simple(value) => Ok(value),
+        EmbeddedValue::Bulk(value) => Ok(std::str::from_utf8(&value)?.to_string()),
+        EmbeddedValue::Int(value) => Ok(value.to_string()),
+        other => Err(anyhow!("unexpected Lux table field value: {other:?}")),
+    }
+}
+
+fn field<'a>(row: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    row.get(key).map(String::as_str)
+}
+
+fn require_field(row: &HashMap<String, String>, key: &str, expected: &str) -> Result<()> {
+    match field(row, key) {
+        Some(actual) if actual == expected => Ok(()),
+        Some(_) | None => bail!("invalid hub token"),
+    }
 }
 
 fn parse_migration(raw: &str) -> Result<Vec<Vec<String>>> {
@@ -797,8 +1186,9 @@ fn parse_migration(raw: &str) -> Result<Vec<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        call_node, decode_invite, hash_token, parse_migration, save_config, start, HubConfig,
-        InviteToken, INIT_HUB, TABLES,
+        call_node, decode_invite, hash_token, parse_migration, save_config, start, AuthResponse,
+        CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken, JoinRequest, PostCmdRequest,
+        RegisterNodeRequest, ADMIN_TOKEN_ENV, INIT_HUB, TABLES,
     };
     use crate::model::{Mesh, Node};
     use crate::paths::ViaPaths;
@@ -806,8 +1196,12 @@ mod tests {
     use crate::state::ViaState;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::sync::Mutex as TokioMutex;
     use tokio::time::{sleep, Duration};
+
+    static ENV_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
 
     #[test]
     fn hub_migration_uses_short_table_names() {
@@ -852,6 +1246,8 @@ mod tests {
 
     #[tokio::test]
     async fn hub_relay_exec_round_trips_without_plaintext_in_hub_store() {
+        let _guard = env_lock().lock().await;
+        std::env::remove_var(ADMIN_TOKEN_ENV);
         let source_temp = TempDir::new().unwrap();
         let target_temp = TempDir::new().unwrap();
         let hub_temp = TempDir::new().unwrap();
@@ -891,13 +1287,6 @@ mod tests {
 
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
-        let config = HubConfig {
-            url: hub_url.clone(),
-            token: None,
-        };
-        save_config(&source_paths, &config).unwrap();
-        save_config(&target_paths, &config).unwrap();
-
         let hub_lux = hub_temp.path().join("lux");
         let hub_task = tokio::spawn(start(
             hub_addr.clone(),
@@ -905,6 +1294,37 @@ mod tests {
             true,
         ));
         wait_for_health(&hub_url).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{hub_url}/v1/meshes"))
+            .json(&CreateMeshRequest {
+                id: mesh.id.clone(),
+                name: "default".to_string(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let source_token = register_test_node(&client, &hub_url, &mesh.id, &source).await;
+        let target_token = register_test_node(&client, &hub_url, &mesh.id, &target).await;
+        save_config(
+            &source_paths,
+            &HubConfig {
+                url: hub_url.clone(),
+                token: Some(source_token),
+            },
+        )
+        .unwrap();
+        save_config(
+            &target_paths,
+            &HubConfig {
+                url: hub_url.clone(),
+                token: Some(target_token),
+            },
+        )
+        .unwrap();
 
         let mut source_state = ViaState::open(source_paths.clone()).await.unwrap();
         source_state.save_mesh(&mesh).await.unwrap();
@@ -972,6 +1392,162 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hub_rejects_commands_without_valid_node_token() {
+        let _guard = env_lock().lock().await;
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        let hub_temp = TempDir::new().unwrap();
+        let hub_addr = free_addr();
+        let hub_url = format!("http://{hub_addr}");
+        let hub_lux = hub_temp.path().join("lux");
+        let hub_task = tokio::spawn(start(
+            hub_addr,
+            Some(hub_lux.to_string_lossy().to_string()),
+            true,
+        ));
+        wait_for_health(&hub_url).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{hub_url}/v1/meshes"))
+            .json(&CreateMeshRequest {
+                id: "mesh-auth".to_string(),
+                name: "default".to_string(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let response = client
+            .post(format!("{hub_url}/v1/cmds"))
+            .json(&PostCmdRequest {
+                mesh: "mesh-auth".to_string(),
+                src: "laptop".to_string(),
+                dst: "rig".to_string(),
+                req: "ciphertext".to_string(),
+                token: None,
+            })
+            .send()
+            .await
+            .unwrap();
+
+        hub_task.abort();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invite_tokens_are_single_use() {
+        let _guard = env_lock().lock().await;
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        let hub_temp = TempDir::new().unwrap();
+        let hub_addr = free_addr();
+        let hub_url = format!("http://{hub_addr}");
+        let hub_lux = hub_temp.path().join("lux");
+        let hub_task = tokio::spawn(start(
+            hub_addr,
+            Some(hub_lux.to_string_lossy().to_string()),
+            true,
+        ));
+        wait_for_health(&hub_url).await;
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{hub_url}/v1/meshes"))
+            .json(&CreateMeshRequest {
+                id: "mesh-join".to_string(),
+                name: "default".to_string(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(format!("{hub_url}/v1/tokens"))
+            .json(&CreateTokenRequest {
+                mesh: "mesh-join".to_string(),
+                name: Some("rig".to_string()),
+                token: "invite-secret".to_string(),
+                exp: crate::util::now_ts() + 60,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        let request = JoinRequest {
+            mesh: "mesh-join".to_string(),
+            node: "node-1".to_string(),
+            slug: "rig".to_string(),
+            token: "invite-secret".to_string(),
+        };
+        client
+            .post(format!("{hub_url}/v1/join"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let second = client
+            .post(format!("{hub_url}/v1/join"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        hub_task.abort();
+        assert_eq!(second.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn hosted_admin_endpoints_require_admin_token_when_configured() {
+        let _guard = env_lock().lock().await;
+        let hub_temp = TempDir::new().unwrap();
+        let hub_addr = free_addr();
+        let hub_url = format!("http://{hub_addr}");
+        let hub_lux = hub_temp.path().join("lux");
+        std::env::set_var(ADMIN_TOKEN_ENV, "admin-secret");
+        let hub_task = tokio::spawn(start(
+            hub_addr,
+            Some(hub_lux.to_string_lossy().to_string()),
+            true,
+        ));
+        wait_for_health(&hub_url).await;
+
+        let client = reqwest::Client::new();
+        let unauth = client
+            .post(format!("{hub_url}/v1/meshes"))
+            .json(&CreateMeshRequest {
+                id: "mesh-admin".to_string(),
+                name: "default".to_string(),
+            })
+            .send()
+            .await
+            .unwrap();
+        let auth = client
+            .post(format!("{hub_url}/v1/meshes"))
+            .bearer_auth("admin-secret")
+            .json(&CreateMeshRequest {
+                id: "mesh-admin".to_string(),
+                name: "default".to_string(),
+            })
+            .send()
+            .await
+            .unwrap();
+
+        hub_task.abort();
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(auth.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    fn env_lock() -> &'static TokioMutex<()> {
+        ENV_LOCK.get_or_init(|| TokioMutex::new(()))
+    }
+
     fn temp_paths(temp: &TempDir) -> ViaPaths {
         ViaPaths {
             root: temp.path().to_path_buf(),
@@ -1002,5 +1578,29 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
         panic!("hub did not become healthy");
+    }
+
+    async fn register_test_node(
+        client: &reqwest::Client,
+        hub_url: &str,
+        mesh: &str,
+        node: &Node,
+    ) -> String {
+        client
+            .post(format!("{hub_url}/v1/nodes/register"))
+            .json(&RegisterNodeRequest {
+                mesh: mesh.to_string(),
+                node: node.id.clone(),
+                slug: node.slug.clone(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<AuthResponse>()
+            .await
+            .unwrap()
+            .token
     }
 }

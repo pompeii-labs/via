@@ -105,6 +105,10 @@ Via daemons are not meant to be exposed directly to the public internet. Treat d
 
 The hub is a relay, not a command authority. CLI requests and daemon responses are encrypted and signed with the mesh key before they reach the hub, so the hub stores and forwards opaque RPC frames.
 
+Hub HTTP and WebSocket calls require per-node hub tokens. Invite tokens are single-use registration credentials; after `via join`, the hub returns a node token and stores only its hash.
+
+When `VIA_HUB_ADMIN_TOKEN` is set on the hub process, admin endpoints require `Authorization: Bearer <token>`. The CLI sends this header automatically when the same env var is set locally.
+
 SSH is used only for bootstrap in `via add`. After a node joins, day-to-day control happens over Via RPC.
 
 ## Install
@@ -173,7 +177,7 @@ Run a self-hosted hub:
 
 ```bash
 via hub migrate --lux-dir /var/lib/via-hub/lux
-via hub start --bind 0.0.0.0:47820 --lux-dir /var/lib/via-hub/lux
+VIA_HUB_ADMIN_TOKEN='<long-random-token>' via hub start --bind 127.0.0.1:47820 --lux-dir /var/lib/via-hub/lux
 ```
 
 For local development you can combine both:
@@ -189,6 +193,16 @@ via hub use http://127.0.0.1:47820
 via start
 ```
 
+`via hub use` registers the local node with the hub and stores a node token in `~/.via/hub.json`.
+
+For a hosted hub, set the same admin token locally when creating the first mesh or invites:
+
+```bash
+export VIA_HUB_ADMIN_TOKEN='<long-random-token>'
+via hub use https://hub.via.pompeiilabs.com
+via invite create --name rig
+```
+
 Create an invite for another node:
 
 ```bash
@@ -202,6 +216,8 @@ via join via1...
 via start
 ```
 
+The `via1...` invite is single-use. `via join` exchanges it with the hub for a node token before writing local mesh state.
+
 Force hub routing when testing NAT behavior:
 
 ```bash
@@ -211,6 +227,8 @@ via deploy nginx:latest --to pi --name web --route hub --port 18080:80
 ```
 
 Hub schema lives in Lux migrations under `lux/migrations/`. Table and column names intentionally stay short: `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
+
+`via nodes` includes nodes discovered through the hub when hub routing is configured.
 
 ## Daily Operations
 
@@ -309,6 +327,8 @@ Implemented:
 - AES-256-GCM encrypted RPC request and response payloads.
 - HMAC-signed RPC frames.
 - Hub relays store opaque encrypted RPC frames, not plaintext commands.
+- Hub invite tokens are single-use and stored hashed.
+- Hub node tokens are required for command posting, node discovery, and daemon WebSocket sessions.
 - Timestamp validation.
 - Nonce replay rejection.
 - Unix mesh key permissions set to `0600`.

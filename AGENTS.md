@@ -57,11 +57,14 @@ via deploy nginx:latest --to rig --name web --route hub --port 18080:80
 Configure hub routing:
 
 ```bash
+export VIA_HUB_ADMIN_TOKEN='<token-if-hosted-hub-requires-it>'
 via hub use https://hub.via.pompeiilabs.com
 via invite create --name pi
 via join <token>
 via start
 ```
+
+`via join` exchanges the single-use invite for a per-node hub token before writing local mesh state. Do not reuse or log invite tokens; they contain mesh bootstrap material.
 
 Read and operate service logs:
 
@@ -118,6 +121,10 @@ formatting -> tests -> build binaries -> deploy release
 
 Hub schema is managed with Lux migrations in `lux/migrations/`. Keep table and column names brief. The initial hub tables are `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
 
+Hub tokens are stored as hashes in `tokens`. Invite tokens use `kind=invite` and are marked `used=true` after a successful join. Long-lived node tokens use `kind=node` and are required for command posting, node discovery, and daemon WebSocket sessions.
+
+If `VIA_HUB_ADMIN_TOKEN` is set on the hub process, admin endpoints require a bearer token. The CLI automatically uses the local `VIA_HUB_ADMIN_TOKEN` environment variable for `via hub use` and `via invite create`.
+
 ## Local Verification
 
 Before committing code changes, run:
@@ -149,4 +156,4 @@ cargo build --locked --release
 
 ## Security Model
 
-Via currently uses a shared mesh key. A node that can read that key has mesh authority. RPC payloads are encrypted and signed before direct or hub transport, and secret values are encrypted at rest, but Via should still be operated only on trusted machines.
+Via currently uses a shared mesh key. A node that can read that key has mesh authority. RPC payloads are encrypted and signed before direct or hub transport, and secret values are encrypted at rest. The hub requires node tokens but must still be treated as relay/auth infrastructure, not as the root cryptographic authority.

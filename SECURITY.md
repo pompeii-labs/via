@@ -30,6 +30,10 @@ This policy covers the Via CLI, daemon, hub, installer, release artifacts, and m
 
 Via currently uses a shared mesh key. A node with access to that key has mesh authority. RPC payloads are encrypted and signed before direct or hub transport, and secrets are encrypted at rest. The hub should see opaque encrypted frames, not plaintext command bodies.
 
+Hub invite tokens are single-use and stored hashed. Successful joins exchange the invite for a per-node hub token, which is required for command posting, node discovery, and daemon WebSocket sessions.
+
+Hosted hubs should run with `VIA_HUB_ADMIN_TOKEN` set. This protects mesh creation, invite creation, and direct node registration endpoints with bearer-token authentication.
+
 ## Disclosure
 
 We will coordinate fixes and disclosure with the reporter. Once a fix is available, we will publish a patched release and note the affected versions.
