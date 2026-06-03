@@ -9,6 +9,7 @@ pub struct ViaPaths {
     pub bin: PathBuf,
     pub mesh_key: PathBuf,
     pub hub_config: PathBuf,
+    pub auth_config: PathBuf,
 }
 
 impl ViaPaths {
@@ -21,6 +22,7 @@ impl ViaPaths {
             bin: root.join("bin"),
             mesh_key: root.join("mesh.key"),
             hub_config: root.join("hub.json"),
+            auth_config: root.join("auth.json"),
             root,
         })
     }

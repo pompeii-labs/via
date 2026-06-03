@@ -64,6 +64,7 @@ via update --all
 Connect LAN machines and off-LAN servers through a hub:
 
 ```bash
+via auth init
 via hub use hosted
 via hub status
 via invite create --name jack-laptop
@@ -221,12 +222,12 @@ Pass a full URL for a self-hosted hub. Use `VIA_HUB_ADMIN_TOKEN` locally when th
 Use the hosted Pompeii Labs hub:
 
 ```bash
-export VIA_API_KEY='<via-api-key>'
+via auth init
 via hub use hosted
 via hub status
 ```
 
-`via hub use hosted` defaults to `https://api.via.pompeiilabs.com` and `https://hub.via.pompeiilabs.com`. Override them with `VIA_CLOUD_API_URL` and `VIA_HOSTED_HUB_URL` for staging. The CLI also accepts `VIA_CLOUD_API_KEY` as a compatibility alias for `VIA_API_KEY`.
+`via auth init` prompts for the API key from the dashboard and stores it in `~/.via/auth.json`. `via hub use hosted` defaults to `https://api.via.pompeiilabs.com` and `https://hub.via.pompeiilabs.com`. Use `VIA_API_KEY` as a CI or non-interactive override; `VIA_CLOUD_API_KEY` remains a compatibility alias. Override service URLs with `VIA_CLOUD_API_URL` and `VIA_HOSTED_HUB_URL` for staging.
 
 Create an invite for another node:
 
@@ -325,8 +326,8 @@ The cloud API should treat this stream as the source of truth for hosted node li
 
 | Variable | Service | Purpose |
 | --- | --- | --- |
-| `VIA_API_KEY` | CLI | Via Cloud API key for `via hub use hosted`. Sent as a bearer token to the cloud API only. |
-| `VIA_CLOUD_API_KEY` | CLI | Compatibility alias for `VIA_API_KEY`. |
+| `VIA_API_KEY` | CLI | CI/non-interactive override for the API key stored by `via auth init`. |
+| `VIA_CLOUD_API_KEY` | CLI | Compatibility alias for hosted hub provisioning. Prefer `VIA_API_KEY`. |
 | `VIA_CLOUD_API_URL` | CLI | Override the cloud API base URL; defaults to `https://api.via.pompeiilabs.com`. |
 | `VIA_HOSTED_HUB_URL` | CLI | Override the hosted hub URL; defaults to `https://hub.via.pompeiilabs.com`. |
 | `VIA_HUB_ADMIN_TOKEN` | Hub/CLI | Self-hosted admin bearer token for mesh creation, invite creation, and direct node registration. Not used for hosted cloud account gating. |
@@ -419,6 +420,7 @@ Updating installs the new binary. Restart running daemons after updating so long
 | `via add rig` | Bootstrap a machine over SSH and join it to the mesh. |
 | `via start` | Start the local daemon in the background. |
 | `via daemon` | Run the daemon in the foreground. |
+| `via auth init` | Save a dashboard API key in `~/.via/auth.json`. |
 | `via hub use hosted` | Configure this mesh to use the hosted Via hub. |
 | `via hub status` | Show the active hub, auth state, and connected nodes. |
 | `via hub list` | Show the one active hub configured for this mesh. |

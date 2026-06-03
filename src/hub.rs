@@ -291,9 +291,9 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
         let local = state.local_node().await?;
         let client = reqwest::Client::new();
         let response = if is_hosted_hub_url(&url)? {
-            provision_hosted_hub(&client, &url, &mesh.id, &local.id, &local.slug).await?
+            provision_hosted_hub(&client, paths, &url, &mesh.id, &local.id, &local.slug).await?
         } else {
-            provision_self_hosted_hub(&client, &url, &mesh.id, &local.id, &local.slug).await?
+            provision_self_hosted_hub(&client, paths, &url, &mesh.id, &local.id, &local.slug).await?
         };
         token = Some(response.token);
     }
@@ -310,12 +310,13 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
 
 async fn provision_hosted_hub(
     client: &reqwest::Client,
+    paths: &ViaPaths,
     hub_url: &str,
     mesh_id: &str,
     node_id: &str,
     node_slug: &str,
 ) -> Result<AuthResponse> {
-    let api_key = cloud_api_key()?;
+    let api_key = cloud_api_key(paths)?;
     let cloud_url = cloud_api_url()?;
     let grant = client
         .post(format!("{cloud_url}{CLOUD_PROVISION_PATH}"))
@@ -356,12 +357,13 @@ async fn provision_hosted_hub(
 
 async fn provision_self_hosted_hub(
     client: &reqwest::Client,
+    paths: &ViaPaths,
     hub_url: &str,
     mesh_id: &str,
     node_id: &str,
     node_slug: &str,
 ) -> Result<AuthResponse> {
-    admin_request(client.post(format!("{hub_url}/v1/meshes")))
+    admin_request(client.post(format!("{hub_url}/v1/meshes")), paths)
         .json(&CreateMeshRequest {
             id: mesh_id.to_string(),
             name: "default".to_string(),
@@ -369,7 +371,7 @@ async fn provision_self_hosted_hub(
         .send()
         .await?
         .error_for_status()?;
-    admin_request(client.post(format!("{hub_url}/v1/nodes/register")))
+    admin_request(client.post(format!("{hub_url}/v1/nodes/register")), paths)
         .json(&RegisterNodeRequest {
             mesh: mesh_id.to_string(),
             node: node_id.to_string(),
@@ -467,7 +469,7 @@ pub async fn create_invite(
     };
 
     let client = reqwest::Client::new();
-    admin_request(client.post(format!("{}/v1/meshes", config.url)))
+    admin_request(client.post(format!("{}/v1/meshes", config.url)), paths)
         .json(&CreateMeshRequest {
             id: mesh.id.clone(),
             name: "default".to_string(),
@@ -475,7 +477,7 @@ pub async fn create_invite(
         .send()
         .await?
         .error_for_status()?;
-    admin_request(client.post(format!("{}/v1/tokens", config.url)))
+    admin_request(client.post(format!("{}/v1/tokens", config.url)), paths)
         .json(&CreateTokenRequest {
             mesh: mesh.id,
             name,
@@ -1171,15 +1173,17 @@ fn cloud_api_url() -> Result<String> {
     }
 }
 
-fn cloud_api_key() -> Result<String> {
-    std::env::var(API_KEY_ENV)
-        .or_else(|_| std::env::var(CLOUD_API_KEY_ENV))
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .map(|key| key.trim().to_string())
+fn cloud_api_key(paths: &ViaPaths) -> Result<String> {
+    crate::auth::resolve_api_key(paths)?
+        .or_else(|| {
+            std::env::var(CLOUD_API_KEY_ENV)
+                .ok()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty())
+        })
         .ok_or_else(|| {
             anyhow!(
-                "missing Via API key for hosted hub; set {API_KEY_ENV} before running `via hub use hosted`"
+                "missing Via API key for hosted hub; run `via auth init` or set {API_KEY_ENV} before running `via hub use hosted`"
             )
         })
 }
@@ -1237,10 +1241,13 @@ fn local_hostname() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn admin_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+fn admin_request(builder: reqwest::RequestBuilder, paths: &ViaPaths) -> reqwest::RequestBuilder {
     match std::env::var(ADMIN_TOKEN_ENV) {
         Ok(token) if !token.is_empty() => builder.bearer_auth(token),
-        _ => builder,
+        _ => match crate::auth::resolve_api_key(paths) {
+            Ok(Some(api_key)) => builder.bearer_auth(api_key),
+            _ => builder,
+        },
     }
 }
 
@@ -2857,6 +2864,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         }
     }
 
