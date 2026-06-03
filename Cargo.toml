@@ -12,6 +12,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+ring = "0.17.14"
 futures-util = "0.3"
 getrandom = "0.2"
 hmac = "0.12"
