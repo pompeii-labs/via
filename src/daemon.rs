@@ -192,6 +192,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = std_listener.local_addr().unwrap();
@@ -236,6 +237,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         crate::security::ensure_mesh_key(&paths).unwrap();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

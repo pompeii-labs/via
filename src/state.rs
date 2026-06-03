@@ -434,6 +434,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -472,6 +473,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -512,6 +514,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths.clone()).await.unwrap();
         state
@@ -542,6 +545,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -578,6 +582,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -609,6 +614,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -643,6 +649,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -681,6 +688,7 @@ mod tests {
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
             hub_config: temp.path().join("hub.json"),
+            auth_config: temp.path().join("auth.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
