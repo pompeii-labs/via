@@ -10,8 +10,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use ring::signature::{UnparsedPublicKey, ED25519};
 use futures_util::{SinkExt, StreamExt};
 use lux::{EmbeddedClient, EmbeddedValue, ServerConfig, ServerHandle};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{interval, sleep, timeout, Duration, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use url::Url;
@@ -29,7 +30,23 @@ use uuid::Uuid;
 
 const INIT_HUB: &str = include_str!("../lux/migrations/20260602000000_init_hub.lux");
 const ADMIN_TOKEN_ENV: &str = "VIA_HUB_ADMIN_TOKEN";
+const ISSUER_PUBKEY_ENV: &str = "VIA_HUB_ISSUER_PUBKEY";
+const CLOUD_INGEST_URL_ENV: &str = "VIA_HUB_CLOUD_INGEST_URL";
+const CLOUD_INGEST_TOKEN_ENV: &str = "VIA_HUB_CLOUD_INGEST_TOKEN";
+const HUB_URL_ENV: &str = "VIA_HUB_URL";
+const CLOUD_API_URL_ENV: &str = "VIA_CLOUD_API_URL";
+const API_KEY_ENV: &str = "VIA_API_KEY";
+const CLOUD_API_KEY_ENV: &str = "VIA_CLOUD_API_KEY";
+const HOSTED_HUB_URL_ENV: &str = "VIA_HOSTED_HUB_URL";
+const GRANT_PREFIX: &str = "viahub1.";
 const HOSTED_HUB_URL: &str = "https://hub.via.pompeiilabs.com";
+const DEFAULT_CLOUD_API_URL: &str = "https://api.via.pompeiilabs.com";
+const CLOUD_PROVISION_PATH: &str = "/api/hub/provision";
+const USAGE_EVENT_BUFFER: usize = 1024;
+const USAGE_EVENT_BATCH_SIZE: usize = 100;
+const USAGE_EVENT_INTERVAL: Duration = Duration::from_secs(10);
+const USAGE_EVENT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const USAGE_EVENT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const TABLES: &[&str] = &[
     "meshes", "nodes", "tokens", "sessions", "cmds", "events", "audit",
 ];
@@ -100,6 +117,51 @@ struct RegisterNodeRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ProvisionGrantRequest {
+    grant: String,
+    #[serde(alias = "node_id")]
+    node: String,
+    #[serde(alias = "node_slug")]
+    slug: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SignedGrantJson {
+    payload: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudProvisionRequest {
+    hub_url: String,
+    mesh_id: String,
+    mesh_name: String,
+    node_id: String,
+    node_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudProvisionResponse {
+    #[serde(alias = "signed_grant")]
+    grant: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HubProvisionGrant {
+    v: u8,
+    aud: String,
+    exp: i64,
+    #[serde(alias = "nonce")]
+    jti: String,
+    #[serde(alias = "account_id")]
+    account: String,
+    #[serde(alias = "mesh_id")]
+    mesh: String,
+    #[serde(default, alias = "mesh_name")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct JoinRequest {
     mesh: String,
     node: String,
@@ -150,9 +212,56 @@ type SessionKey = (String, String);
 struct HubRuntime {
     db: HubDb,
     admin_token: Option<String>,
+    issuer_pubkey: Option<Vec<u8>>,
+    hub_url: Option<String>,
+    usage_reporter: Option<UsageReporter>,
     sessions: Mutex<HashMap<SessionKey, mpsc::Sender<HubToAgent>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     results: Mutex<HashMap<String, CmdResponse>>,
+    seen_grants: Mutex<HashMap<String, i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UsageEvent {
+    account_id: String,
+    mesh_id: String,
+    node_id: String,
+    event_type: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageEventBatch {
+    events: Vec<UsageEvent>,
+}
+
+#[derive(Clone)]
+struct UsageReporter {
+    tx: mpsc::Sender<UsageEvent>,
+}
+
+impl UsageReporter {
+    fn from_env() -> Option<Self> {
+        let url = std::env::var(CLOUD_INGEST_URL_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let token = std::env::var(CLOUD_INGEST_TOKEN_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        Some(spawn_usage_reporter(
+            url,
+            token,
+            USAGE_EVENT_INTERVAL,
+            USAGE_EVENT_BATCH_SIZE,
+            USAGE_EVENT_BUFFER,
+        ))
+    }
+
+    fn enqueue(&self, event: UsageEvent) {
+        if let Err(error) = self.tx.try_send(event) {
+            eprintln!("via hub usage event dropped: {error}");
+        }
+    }
 }
 
 pub fn configured(paths: &ViaPaths) -> bool {
@@ -181,25 +290,11 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
     if let Some(mesh) = state.mesh().await? {
         let local = state.local_node().await?;
         let client = reqwest::Client::new();
-        admin_request(client.post(format!("{url}/v1/meshes")))
-            .json(&CreateMeshRequest {
-                id: mesh.id,
-                name: "default".to_string(),
-            })
-            .send()
-            .await?
-            .error_for_status()?;
-        let response = admin_request(client.post(format!("{url}/v1/nodes/register")))
-            .json(&RegisterNodeRequest {
-                mesh: state.mesh().await?.expect("mesh checked above").id,
-                node: local.id,
-                slug: local.slug,
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<AuthResponse>()
-            .await?;
+        let response = if is_hosted_hub_url(&url)? {
+            provision_hosted_hub(&client, &url, &mesh.id, &local.id, &local.slug).await?
+        } else {
+            provision_self_hosted_hub(&client, &url, &mesh.id, &local.id, &local.slug).await?
+        };
         token = Some(response.token);
     }
     save_config(
@@ -211,6 +306,81 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
     )?;
     println!("Via hub set to {url}.");
     Ok(())
+}
+
+async fn provision_hosted_hub(
+    client: &reqwest::Client,
+    hub_url: &str,
+    mesh_id: &str,
+    node_id: &str,
+    node_slug: &str,
+) -> Result<AuthResponse> {
+    let api_key = cloud_api_key()?;
+    let cloud_url = cloud_api_url()?;
+    let grant = client
+        .post(format!("{cloud_url}{CLOUD_PROVISION_PATH}"))
+        .bearer_auth(api_key)
+        .json(&CloudProvisionRequest {
+            hub_url: hub_url.to_string(),
+            mesh_id: mesh_id.to_string(),
+            mesh_name: "default".to_string(),
+            node_id: node_id.to_string(),
+            node_slug: node_slug.to_string(),
+        })
+        .send()
+        .await
+        .context("failed to request hosted hub grant from Via cloud")?
+        .error_for_status()
+        .map_err(|error| cloud_provision_error(error))?
+        .json::<CloudProvisionResponse>()
+        .await
+        .context("Via cloud returned an invalid hosted hub grant response")?
+        .grant;
+
+    client
+        .post(format!("{hub_url}/v1/grants/provision"))
+        .json(&ProvisionGrantRequest {
+            grant,
+            node: node_id.to_string(),
+            slug: node_slug.to_string(),
+        })
+        .send()
+        .await
+        .context("failed to provision hosted hub with cloud grant")?
+        .error_for_status()
+        .map_err(|error| hosted_hub_grant_error(error))?
+        .json::<AuthResponse>()
+        .await
+        .context("hosted hub returned an invalid provisioning response")
+}
+
+async fn provision_self_hosted_hub(
+    client: &reqwest::Client,
+    hub_url: &str,
+    mesh_id: &str,
+    node_id: &str,
+    node_slug: &str,
+) -> Result<AuthResponse> {
+    admin_request(client.post(format!("{hub_url}/v1/meshes")))
+        .json(&CreateMeshRequest {
+            id: mesh_id.to_string(),
+            name: "default".to_string(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    admin_request(client.post(format!("{hub_url}/v1/nodes/register")))
+        .json(&RegisterNodeRequest {
+            mesh: mesh_id.to_string(),
+            node: node_id.to_string(),
+            slug: node_slug.to_string(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<AuthResponse>()
+        .await
+        .context("self-hosted hub returned an invalid registration response")
 }
 
 pub async fn status(state: &ViaState) -> Result<()> {
@@ -464,20 +634,33 @@ pub async fn start(bind: String, lux_dir: Option<String>, migrate: bool) -> Resu
     } else {
         db.check_schema().await?;
     }
+    let issuer_pubkey = load_issuer_pubkey()?;
+    let usage_reporter = issuer_pubkey
+        .as_ref()
+        .and_then(|_| UsageReporter::from_env());
     let runtime = Arc::new(HubRuntime {
         db,
         admin_token: std::env::var(ADMIN_TOKEN_ENV)
             .ok()
             .filter(|token| !token.is_empty()),
+        issuer_pubkey,
+        hub_url: std::env::var(HUB_URL_ENV)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .map(|url| normalize_http_url(&url))
+            .transpose()?,
+        usage_reporter,
         sessions: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
+        seen_grants: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/agent/connect", get(agent_connect))
         .route("/v1/meshes", post(create_mesh))
         .route("/v1/tokens", post(create_token))
+        .route("/v1/grants/provision", post(provision_with_grant))
         .route("/v1/join", post(join_mesh))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/register", post(register_node))
@@ -543,6 +726,31 @@ async fn register_node(
     match runtime
         .db
         .register_node(&req.mesh, &req.node, &req.slug)
+        .await
+    {
+        Ok(token) => Json(AuthResponse { token }).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn provision_with_grant(
+    State(runtime): State<Arc<HubRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ProvisionGrantRequest>,
+) -> impl IntoResponse {
+    let grant = match verify_grant(&runtime, &headers, &req.grant).await {
+        Ok(grant) => grant,
+        Err(error) => return (StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
+    };
+    match runtime
+        .db
+        .provision_grant_mesh(
+            &grant.mesh,
+            grant.name.as_deref(),
+            &grant.account,
+            &req.node,
+            &req.slug,
+        )
         .await
     {
         Ok(token) => Json(AuthResponse { token }).into_response(),
@@ -701,6 +909,13 @@ async fn handle_agent(mut socket: WebSocket, runtime: Arc<HubRuntime>, query: Ag
     let _ = runtime.db.insert_node(&query).await;
     let session_id = Uuid::new_v4().to_string();
     let _ = runtime.db.insert_session(&session_id, &query).await;
+    emit_cloud_usage_events(
+        &runtime,
+        &query.mesh,
+        &query.node,
+        &["connected", "session_started"],
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -734,7 +949,139 @@ async fn handle_agent(mut socket: WebSocket, runtime: Arc<HubRuntime>, query: Ag
         .sessions
         .lock()
         .await
-        .remove(&(query.mesh, query.slug));
+        .remove(&(query.mesh.clone(), query.slug));
+    let _ = runtime.db.mark_node_offline(&query.mesh, &query.node).await;
+    emit_cloud_usage_events(
+        &runtime,
+        &query.mesh,
+        &query.node,
+        &["session_ended", "disconnected"],
+    )
+    .await;
+}
+
+async fn emit_cloud_usage_events(
+    runtime: &HubRuntime,
+    mesh: &str,
+    node: &str,
+    event_types: &[&str],
+) {
+    let Some(reporter) = runtime.usage_reporter.as_ref() else {
+        return;
+    };
+    let account = match runtime.db.mesh_account(mesh).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("via hub usage event skipped: {error}");
+            return;
+        }
+    };
+    let timestamp = now_ts();
+    for event_type in event_types {
+        reporter.enqueue(UsageEvent {
+            account_id: account.clone(),
+            mesh_id: mesh.to_string(),
+            node_id: node.to_string(),
+            event_type: (*event_type).to_string(),
+            timestamp,
+        });
+    }
+}
+
+fn spawn_usage_reporter(
+    url: String,
+    token: String,
+    flush_interval: Duration,
+    batch_size: usize,
+    buffer_size: usize,
+) -> UsageReporter {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    tokio::spawn(run_usage_reporter(
+        reqwest::Client::new(),
+        url,
+        token,
+        flush_interval,
+        batch_size,
+        buffer_size,
+        rx,
+    ));
+    UsageReporter { tx }
+}
+
+async fn run_usage_reporter(
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    flush_interval: Duration,
+    batch_size: usize,
+    max_pending: usize,
+    mut rx: mpsc::Receiver<UsageEvent>,
+) {
+    let mut ticker = interval(flush_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut pending = Vec::new();
+    let mut backoff = USAGE_EVENT_BACKOFF_INITIAL;
+    loop {
+        tokio::select! {
+            Some(event) = rx.recv() => {
+                if pending.len() >= max_pending {
+                    eprintln!("via hub usage retry buffer full; event dropped");
+                } else {
+                    pending.push(event);
+                }
+                while pending.len() < batch_size {
+                    match rx.try_recv() {
+                        Ok(event) if pending.len() < max_pending => pending.push(event),
+                        Ok(_) => eprintln!("via hub usage retry buffer full; event dropped"),
+                        Err(_) => break,
+                    }
+                }
+                if pending.len() >= batch_size && post_usage_batch(&client, &url, &token, &pending).await.is_ok() {
+                    pending.clear();
+                    backoff = USAGE_EVENT_BACKOFF_INITIAL;
+                }
+            }
+            _ = ticker.tick() => {
+                if pending.is_empty() {
+                    continue;
+                }
+                match post_usage_batch(&client, &url, &token, &pending).await {
+                    Ok(()) => {
+                        pending.clear();
+                        backoff = USAGE_EVENT_BACKOFF_INITIAL;
+                    }
+                    Err(error) => {
+                        eprintln!("via hub usage ingest failed: {error}");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(USAGE_EVENT_BACKOFF_MAX);
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+}
+
+async fn post_usage_batch(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    events: &[UsageEvent],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    client
+        .post(url)
+        .bearer_auth(token)
+        .json(&UsageEventBatch {
+            events: events.to_vec(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 async fn agent_loop(config: HubConfig, mesh: Mesh, node: Node, tx: mpsc::Sender<HubAgentRpc>) {
@@ -806,9 +1153,58 @@ fn normalize_http_url(raw: &str) -> Result<String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+fn hosted_hub_url() -> Result<String> {
+    match std::env::var(HOSTED_HUB_URL_ENV) {
+        Ok(url) if !url.trim().is_empty() => normalize_http_url(url.trim()),
+        _ => Ok(HOSTED_HUB_URL.to_string()),
+    }
+}
+
+fn is_hosted_hub_url(url: &str) -> Result<bool> {
+    Ok(normalize_http_url(url)? == hosted_hub_url()?)
+}
+
+fn cloud_api_url() -> Result<String> {
+    match std::env::var(CLOUD_API_URL_ENV) {
+        Ok(url) if !url.trim().is_empty() => normalize_http_url(url.trim()),
+        _ => Ok(DEFAULT_CLOUD_API_URL.to_string()),
+    }
+}
+
+fn cloud_api_key() -> Result<String> {
+    std::env::var(API_KEY_ENV)
+        .or_else(|_| std::env::var(CLOUD_API_KEY_ENV))
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "missing Via API key for hosted hub; set {API_KEY_ENV} before running `via hub use hosted`"
+            )
+        })
+}
+
+fn cloud_provision_error(error: reqwest::Error) -> anyhow::Error {
+    match error.status() {
+        Some(reqwest::StatusCode::UNAUTHORIZED) | Some(reqwest::StatusCode::FORBIDDEN) => {
+            anyhow!("Via cloud rejected the API key; check {API_KEY_ENV} and try again")
+        }
+        _ => anyhow!(error).context("Via cloud rejected the hosted hub grant request"),
+    }
+}
+
+fn hosted_hub_grant_error(error: reqwest::Error) -> anyhow::Error {
+    match error.status() {
+        Some(reqwest::StatusCode::UNAUTHORIZED) | Some(reqwest::StatusCode::FORBIDDEN) => {
+            anyhow!("hosted hub rejected the cloud grant; it may have expired, retry `via hub use hosted`")
+        }
+        _ => anyhow!(error).context("hosted hub rejected the cloud grant"),
+    }
+}
+
 fn normalize_hub_ref(raw: &str) -> Result<String> {
     match raw {
-        "hosted" | "via" | "default" => Ok(HOSTED_HUB_URL.to_string()),
+        "hosted" | "via" | "default" => hosted_hub_url(),
         _ => normalize_http_url(raw),
     }
 }
@@ -846,6 +1242,131 @@ fn admin_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         Ok(token) if !token.is_empty() => builder.bearer_auth(token),
         _ => builder,
     }
+}
+
+fn load_issuer_pubkey() -> Result<Option<Vec<u8>>> {
+    let Some(raw) = std::env::var(ISSUER_PUBKEY_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let bytes = decode_base64(&raw).context("invalid issuer public key")?;
+    if bytes.len() != 32 {
+        bail!("issuer public key must be 32 bytes");
+    }
+    Ok(Some(bytes))
+}
+
+async fn verify_grant(
+    runtime: &HubRuntime,
+    headers: &HeaderMap,
+    grant: &str,
+) -> Result<HubProvisionGrant> {
+    let issuer_pubkey = runtime
+        .issuer_pubkey
+        .as_ref()
+        .ok_or_else(|| anyhow!("grant provisioning is not configured"))?;
+    let (payload, signature) = decode_signed_grant(grant)?;
+    UnparsedPublicKey::new(&ED25519, issuer_pubkey)
+        .verify(&payload, &signature)
+        .map_err(|_| anyhow!("invalid grant signature"))?;
+    let claims: HubProvisionGrant = serde_json::from_slice(&payload)?;
+    if claims.v != 1 {
+        bail!("unsupported grant version");
+    }
+    if claims.exp < now_ts() {
+        bail!("grant expired");
+    }
+    if claims.jti.trim().is_empty() {
+        bail!("grant missing jti");
+    }
+    if claims.account.trim().is_empty() {
+        bail!("grant missing account");
+    }
+    if claims.mesh.trim().is_empty() {
+        bail!("grant missing mesh");
+    }
+    let expected_audience = grant_audience(runtime, headers)?;
+    if normalize_http_url(&claims.aud)? != expected_audience {
+        bail!("grant audience mismatch");
+    }
+    let mut seen = runtime.seen_grants.lock().await;
+    let now = now_ts();
+    seen.retain(|_, exp| *exp >= now);
+    if seen.contains_key(&claims.jti) {
+        bail!("grant replayed");
+    }
+    seen.insert(claims.jti.clone(), claims.exp);
+    Ok(claims)
+}
+
+fn decode_signed_grant(grant: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(raw) = grant.strip_prefix(GRANT_PREFIX) {
+        let mut parts = raw.split('.');
+        let payload = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing payload"))?;
+        let signature = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing signature"))?;
+        if parts.next().is_some() {
+            bail!("invalid grant format");
+        }
+        return signed_grant_parts(payload, signature);
+    }
+    if grant.contains('.') {
+        let mut parts = grant.split('.');
+        let payload = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing payload"))?;
+        let signature = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing signature"))?;
+        if parts.next().is_some() {
+            bail!("invalid grant format");
+        }
+        return signed_grant_parts(payload, signature);
+    }
+    let grant: SignedGrantJson = serde_json::from_str(grant)?;
+    signed_grant_parts(&grant.payload, &grant.signature)
+}
+
+fn signed_grant_parts(payload: &str, signature: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let payload = URL_SAFE_NO_PAD.decode(payload)?;
+    let signature = decode_base64(signature)?;
+    if signature.len() != 64 {
+        bail!("grant signature must be 64 bytes");
+    }
+    Ok((payload, signature))
+}
+
+fn decode_base64(raw: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| URL_SAFE.decode(raw))
+        .or_else(|_| STANDARD.decode(raw))
+        .map_err(|error| error.into())
+}
+
+fn grant_audience(runtime: &HubRuntime, headers: &HeaderMap) -> Result<String> {
+    if let Some(url) = runtime.hub_url.as_deref() {
+        return Ok(url.to_string());
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .ok_or_else(|| anyhow!("missing host header"))?
+        .to_str()
+        .context("invalid host header")?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http")
+        .split(',')
+        .next()
+        .unwrap_or("http")
+        .trim();
+    normalize_http_url(&format!("{scheme}://{host}"))
 }
 
 fn require_admin(runtime: &HubRuntime, headers: &HeaderMap) -> Result<()> {
@@ -978,6 +1499,42 @@ impl HubDb {
         self.create_node_token(mesh, slug).await
     }
 
+    async fn provision_grant_mesh(
+        &self,
+        mesh: &str,
+        name: Option<&str>,
+        account: &str,
+        node: &str,
+        slug: &str,
+    ) -> Result<String> {
+        self.insert_mesh(mesh, name.unwrap_or("default")).await?;
+        self.record_mesh_account(mesh, account).await?;
+        self.register_node(mesh, node, slug).await
+    }
+
+    async fn record_mesh_account(&self, mesh: &str, account: &str) -> Result<()> {
+        self.client
+            .execute(
+                "TUPDATE",
+                &["meshes", "SET", "account", account, "WHERE", "id", "=", mesh],
+            )
+            .await?;
+        self.persist().await
+    }
+
+    async fn mesh_account(&self, mesh: &str) -> Result<Option<String>> {
+        let row = self
+            .select_rows("meshes", &["WHERE", "id", "=", mesh, "LIMIT", "1"])
+            .await?
+            .into_iter()
+            .next();
+        Ok(row.and_then(|row| {
+            field(&row, "account")
+                .filter(|account| !account.is_empty())
+                .map(str::to_string)
+        }))
+    }
+
     async fn claim_invite(
         &self,
         mesh: &str,
@@ -1082,7 +1639,31 @@ impl HubDb {
                 ("status", "online"),
             ],
         )
-        .await
+        .await?;
+        self.client
+            .execute(
+                "TUPDATE",
+                &[
+                    "nodes", "SET", "seen", &seen, "status", "online", "WHERE", "id", "=",
+                    node,
+                ],
+            )
+            .await?;
+        self.persist().await
+    }
+
+    async fn mark_node_offline(&self, _mesh: &str, node: &str) -> Result<()> {
+        let seen = now_ts().to_string();
+        self.client
+            .execute(
+                "TUPDATE",
+                &[
+                    "nodes", "SET", "seen", &seen, "status", "offline", "WHERE", "id", "=",
+                    node,
+                ],
+            )
+            .await?;
+        self.persist().await
     }
 
     async fn nodes(&self, mesh: &str) -> Result<Vec<HubNode>> {
@@ -1254,9 +1835,13 @@ fn parse_migration(raw: &str) -> Result<Vec<Vec<String>>> {
 mod tests {
     use super::{
         call_node, decode_invite, hash_token, normalize_hub_ref, parse_migration, save_config,
-        start, AuthResponse, CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken,
-        JoinRequest, PostCmdRequest, RegisterNodeRequest, ADMIN_TOKEN_ENV, HOSTED_HUB_URL,
-        INIT_HUB, TABLES,
+        emit_cloud_usage_events, post_usage_batch, spawn_usage_reporter, start, use_hub,
+        AuthResponse,
+        CreateMeshRequest, CreateTokenRequest, HubConfig, HubDb, HubRuntime, InviteToken,
+        JoinRequest, PostCmdRequest, RegisterNodeRequest, UsageEvent, UsageEventBatch,
+        ADMIN_TOKEN_ENV, API_KEY_ENV, CLOUD_API_KEY_ENV, CLOUD_API_URL_ENV,
+        CLOUD_INGEST_TOKEN_ENV, CLOUD_INGEST_URL_ENV, GRANT_PREFIX, HOSTED_HUB_URL,
+        HOSTED_HUB_URL_ENV, HUB_URL_ENV, INIT_HUB, ISSUER_PUBKEY_ENV, TABLES,
     };
     use crate::model::{Mesh, Node};
     use crate::paths::ViaPaths;
@@ -1264,10 +1849,18 @@ mod tests {
     use crate::state::ViaState;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex as TokioMutex;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, timeout, Duration};
 
     static ENV_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
 
@@ -1326,7 +1919,7 @@ mod tests {
     #[tokio::test]
     async fn hub_relay_exec_round_trips_without_plaintext_in_hub_store() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let source_temp = TempDir::new().unwrap();
         let target_temp = TempDir::new().unwrap();
         let hub_temp = TempDir::new().unwrap();
@@ -1474,7 +2067,7 @@ mod tests {
     #[tokio::test]
     async fn hub_rejects_commands_without_valid_node_token() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
@@ -1518,7 +2111,7 @@ mod tests {
     #[tokio::test]
     async fn invite_tokens_are_single_use() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
@@ -1582,12 +2175,244 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_admin_endpoints_require_admin_token_when_configured() {
+    async fn valid_grant_provisions_mesh_and_node_token() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let client = reqwest::Client::new();
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-valid",
+            "mesh-grant",
+        );
+
+        let auth = client
+            .post(format!("{}/v1/grants/provision", hub.url))
+            .json(&serde_json::json!({
+                "grant": grant,
+                "node": "node-1",
+                "slug": "rig"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<AuthResponse>()
+            .await
+            .unwrap();
+        let nodes = client
+            .get(format!("{}/v1/nodes", hub.url))
+            .query(&[
+                ("mesh", "mesh-grant"),
+                ("node", "rig"),
+                ("token", auth.token.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(nodes.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn hosted_hub_use_requests_cloud_grant_and_stores_node_token() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        std::env::set_var(HOSTED_HUB_URL_ENV, &hub.url);
+        std::env::set_var(API_KEY_ENV, "via_test_key");
+        let cloud = start_cloud_provision_server(hub.url.clone(), hub.key_pair, "via_test_key")
+            .await;
+        std::env::set_var(CLOUD_API_URL_ENV, &cloud.url);
+        let temp = TempDir::new().unwrap();
+        let paths = temp_paths(&temp);
+        let mut state = ViaState::open(paths.clone()).await.unwrap();
+        let mesh = Mesh {
+            id: "mesh-hosted-cli".to_string(),
+            created_at: crate::util::now_ts(),
+        };
+        let node = Node {
+            id: "node-hosted-cli".to_string(),
+            slug: "rig".to_string(),
+            display_name: "rig".to_string(),
+            addresses: Vec::new(),
+            daemon_addr: "127.0.0.1:47819".to_string(),
+            public: false,
+            created_at: crate::util::now_ts(),
+            last_seen_at: None,
+        };
+        state.save_mesh(&mesh).await.unwrap();
+        state.upsert_node(&node).await.unwrap();
+        state.save_local_node_id(&node.id).await.unwrap();
+
+        use_hub(&state, &paths, "hosted".to_string()).await.unwrap();
+        let config = super::load_config(&paths).unwrap().unwrap();
+        let nodes = reqwest::Client::new()
+            .get(format!("{}/v1/nodes", hub.url))
+            .query(&[
+                ("mesh", mesh.id.as_str()),
+                ("node", node.slug.as_str()),
+                ("token", config.token.as_deref().unwrap()),
+            ])
+            .send()
+            .await
+            .unwrap();
+
+        state.shutdown().await.unwrap();
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(config.url, hub.url);
+        assert!(config.token.is_some());
+        assert_eq!(nodes.status(), reqwest::StatusCode::OK);
+        let requests = cloud.requests.lock().await.clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].hub_url, hub.url);
+        assert_eq!(requests[0].mesh_id, mesh.id);
+        assert_eq!(requests[0].node_id, node.id);
+        assert_eq!(requests[0].node_slug, node.slug);
+    }
+
+    #[tokio::test]
+    async fn self_hosted_hub_use_stays_admin_token_only() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub_temp = TempDir::new().unwrap();
+        let hub_addr = free_addr();
+        let hub_url = format!("http://{hub_addr}");
+        let hub_lux = hub_temp.path().join("lux");
+        std::env::set_var(ADMIN_TOKEN_ENV, "admin-secret");
+        let hub_task = tokio::spawn(start(
+            hub_addr,
+            Some(hub_lux.to_string_lossy().to_string()),
+            true,
+        ));
+        wait_for_health(&hub_url).await;
+        let cloud = start_unexpected_cloud_server().await;
+        std::env::set_var(CLOUD_API_URL_ENV, &cloud.url);
+        let temp = TempDir::new().unwrap();
+        let paths = temp_paths(&temp);
+        let mut state = ViaState::open(paths.clone()).await.unwrap();
+        let mesh = Mesh {
+            id: "mesh-self-hosted-cli".to_string(),
+            created_at: crate::util::now_ts(),
+        };
+        let node = Node {
+            id: "node-self-hosted-cli".to_string(),
+            slug: "rig".to_string(),
+            display_name: "rig".to_string(),
+            addresses: Vec::new(),
+            daemon_addr: "127.0.0.1:47819".to_string(),
+            public: false,
+            created_at: crate::util::now_ts(),
+            last_seen_at: None,
+        };
+        state.save_mesh(&mesh).await.unwrap();
+        state.upsert_node(&node).await.unwrap();
+        state.save_local_node_id(&node.id).await.unwrap();
+
+        use_hub(&state, &paths, hub_url.clone()).await.unwrap();
+        let config = super::load_config(&paths).unwrap().unwrap();
+
+        state.shutdown().await.unwrap();
+        hub_task.abort();
+        clear_hub_env();
+        assert_eq!(config.url, hub_url);
+        assert!(config.token.is_some());
+        assert_eq!(*cloud.hits.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() - 1,
+            "jti-expired",
+            "mesh-expired",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bad_signature_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let other_key = test_key_pair(8);
+        let grant = signed_grant(
+            &other_key,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-bad-sig",
+            "mesh-bad-sig",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            "https://wrong-hub.example",
+            crate::util::now_ts() + 60,
+            "jti-wrong-aud",
+            "mesh-wrong-aud",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn replayed_grant_jti_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-replay",
+            "mesh-replay",
+        );
+        let first = post_grant(&hub.url, grant.clone()).await;
+        let second = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        assert_eq!(second.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn no_issuer_pubkey_preserves_admin_token_flow() {
         let _guard = env_lock().lock().await;
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
         let hub_lux = hub_temp.path().join("lux");
+        clear_hub_env();
         std::env::set_var(ADMIN_TOKEN_ENV, "admin-secret");
         let hub_task = tokio::spawn(start(
             hub_addr,
@@ -1618,9 +2443,406 @@ mod tests {
             .unwrap();
 
         hub_task.abort();
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
         assert_eq!(auth.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+
+    #[tokio::test]
+    async fn usage_events_batch_to_cloud_ingest() {
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let reporter = spawn_usage_reporter(
+            ingest.url,
+            "ingest-secret".to_string(),
+            Duration::from_millis(25),
+            2,
+            8,
+        );
+
+        reporter.enqueue(test_usage_event("connected"));
+        reporter.enqueue(test_usage_event("session_started"));
+        reporter.enqueue(test_usage_event("disconnected"));
+
+        let recorded = wait_for_batches(&batches, 2).await;
+        assert_eq!(recorded.iter().map(Vec::len).sum::<usize>(), 3);
+        assert!(recorded.iter().any(|batch| batch.len() == 2));
+        assert!(recorded.iter().any(|batch| batch.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn cloud_mesh_usage_events_are_emitted() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let temp = TempDir::new().unwrap();
+        let db = HubDb::open(Some(temp.path().join("lux").to_string_lossy().to_string()))
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        db.provision_grant_mesh("mesh-cloud", Some("default"), "acct_123", "node-1", "rig")
+            .await
+            .unwrap();
+        let runtime = HubRuntime {
+            db,
+            admin_token: None,
+            issuer_pubkey: None,
+            hub_url: None,
+            usage_reporter: Some(spawn_usage_reporter(
+                ingest.url,
+                "ingest-secret".to_string(),
+                Duration::from_millis(25),
+                10,
+                8,
+            )),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+            results: tokio::sync::Mutex::new(HashMap::new()),
+            seen_grants: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        emit_cloud_usage_events(
+            &runtime,
+            "mesh-cloud",
+            "node-1",
+            &["connected", "session_started", "session_ended", "disconnected"],
+        )
+        .await;
+
+        let recorded = wait_for_batches(&batches, 1).await;
+        let events = recorded.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| event.account_id == "acct_123"));
+        assert!(events.iter().all(|event| event.mesh_id == "mesh-cloud"));
+        assert!(events.iter().all(|event| event.node_id == "node-1"));
+        assert!(events.iter().any(|event| event.event_type == "connected"));
+        assert!(events.iter().any(|event| event.event_type == "session_started"));
+        assert!(events.iter().any(|event| event.event_type == "session_ended"));
+        assert!(events.iter().any(|event| event.event_type == "disconnected"));
+    }
+
+    #[tokio::test]
+    async fn non_cloud_mesh_usage_events_are_not_emitted() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let temp = TempDir::new().unwrap();
+        let db = HubDb::open(Some(temp.path().join("lux").to_string_lossy().to_string()))
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        db.insert_mesh("mesh-oss", "default").await.unwrap();
+        db.register_node("mesh-oss", "node-1", "rig").await.unwrap();
+        let runtime = HubRuntime {
+            db,
+            admin_token: None,
+            issuer_pubkey: None,
+            hub_url: None,
+            usage_reporter: Some(spawn_usage_reporter(
+                ingest.url,
+                "ingest-secret".to_string(),
+                Duration::from_millis(25),
+                10,
+                8,
+            )),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+            results: tokio::sync::Mutex::new(HashMap::new()),
+            seen_grants: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        emit_cloud_usage_events(&runtime, "mesh-oss", "node-1", &["connected"]).await;
+        sleep(Duration::from_millis(75)).await;
+
+        assert!(batches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_ingest_failure_does_not_block_event_production() {
+        let event = test_usage_event("connected");
+        let started = std::time::Instant::now();
+        let result = timeout(
+            Duration::from_millis(100),
+            post_usage_batch(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/v1/hub/events",
+                "ingest-secret",
+                &[event],
+            ),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    struct GrantHub {
+        url: String,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        key_pair: Ed25519KeyPair,
+        _temp: TempDir,
+    }
+
+    impl GrantHub {
+        async fn start() -> Self {
+            let key_pair = test_key_pair(7);
+            let public_key = URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref());
+            let hub_temp = TempDir::new().unwrap();
+            let hub_addr = free_addr();
+            let hub_url = format!("http://{hub_addr}");
+            let hub_lux = hub_temp.path().join("lux");
+            std::env::set_var(ISSUER_PUBKEY_ENV, public_key);
+            std::env::set_var(HUB_URL_ENV, &hub_url);
+            let task = tokio::spawn(start(
+                hub_addr,
+                Some(hub_lux.to_string_lossy().to_string()),
+                true,
+            ));
+            wait_for_health(&hub_url).await;
+            Self {
+                url: hub_url,
+                task,
+                key_pair,
+                _temp: hub_temp,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    struct TestCloudProvisionRequest {
+        hub_url: String,
+        mesh_id: String,
+        mesh_name: String,
+        node_id: String,
+        node_slug: String,
+    }
+
+    struct CloudProvisionServer {
+        url: String,
+        requests: Arc<TokioMutex<Vec<TestCloudProvisionRequest>>>,
+        _task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn start_cloud_provision_server(
+        audience: String,
+        key_pair: Ed25519KeyPair,
+        expected_api_key: &'static str,
+    ) -> CloudProvisionServer {
+        let requests = Arc::new(TokioMutex::new(Vec::<TestCloudProvisionRequest>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_pair = Arc::new(key_pair);
+        async fn provision_handler(
+            axum::extract::State((requests, audience, key_pair, expected_api_key)): axum::extract::State<(
+                Arc<TokioMutex<Vec<TestCloudProvisionRequest>>>,
+                String,
+                Arc<Ed25519KeyPair>,
+                &'static str,
+            )>,
+            headers: HeaderMap,
+            Json(req): Json<TestCloudProvisionRequest>,
+        ) -> impl IntoResponse {
+            let expected_auth = format!("Bearer {expected_api_key}");
+            if headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                != Some(expected_auth.as_str())
+            {
+                return axum::http::StatusCode::UNAUTHORIZED.into_response();
+            }
+            requests.lock().await.push(req.clone());
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "v": 1,
+                "aud": audience,
+                "exp": crate::util::now_ts() + 60,
+                "jti": format!("jti-{}", req.node_id),
+                "account_id": "acct_cli",
+                "mesh_id": req.mesh_id,
+                "mesh_name": req.mesh_name
+            }))
+            .unwrap();
+            let signature = key_pair.sign(&payload);
+            Json(serde_json::json!({
+                "grant": format!(
+                    "{GRANT_PREFIX}{}.{}",
+                    URL_SAFE_NO_PAD.encode(payload),
+                    URL_SAFE_NO_PAD.encode(signature.as_ref())
+                )
+            }))
+            .into_response()
+        }
+
+        let app = Router::new()
+            .route("/api/hub/provision", post(provision_handler))
+            .with_state((
+                requests.clone(),
+                audience,
+                key_pair,
+                expected_api_key,
+            ));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await?;
+            Ok(())
+        });
+        CloudProvisionServer {
+            url: format!("http://{addr}"),
+            requests,
+            _task: task,
+        }
+    }
+
+    struct UnexpectedCloudServer {
+        url: String,
+        hits: Arc<TokioMutex<usize>>,
+        _task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn start_unexpected_cloud_server() -> UnexpectedCloudServer {
+        let hits = Arc::new(TokioMutex::new(0usize));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        async fn handler(
+            axum::extract::State(hits): axum::extract::State<Arc<TokioMutex<usize>>>,
+        ) -> impl IntoResponse {
+            *hits.lock().await += 1;
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app = Router::new()
+            .route("/api/hub/provision", post(handler))
+            .with_state(hits.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await?;
+            Ok(())
+        });
+        UnexpectedCloudServer {
+            url: format!("http://{addr}"),
+            hits,
+            _task: task,
+        }
+    }
+
+
+    struct IngestServer {
+        url: String,
+        _task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn start_ingest_server(
+        batches: Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+        status: axum::http::StatusCode,
+    ) -> IngestServer {
+        async fn ingest_handler(
+            axum::extract::State((batches, status)): axum::extract::State<(
+                Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+                axum::http::StatusCode,
+            )>,
+            headers: HeaderMap,
+            Json(batch): Json<UsageEventBatch>,
+        ) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer ingest-secret")
+            );
+            batches.lock().await.push(batch.events);
+            status
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/hub/events", post(ingest_handler))
+            .with_state((batches, status));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await?;
+            Ok(())
+        });
+        IngestServer {
+            url: format!("http://{addr}/v1/hub/events"),
+            _task: task,
+        }
+    }
+
+    async fn wait_for_batches(
+        batches: &Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+        expected: usize,
+    ) -> Vec<Vec<UsageEvent>> {
+        for _ in 0..50 {
+            let snapshot = batches.lock().await.clone();
+            if snapshot.len() >= expected {
+                return snapshot;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        batches.lock().await.clone()
+    }
+
+    fn test_usage_event(event_type: &str) -> UsageEvent {
+        UsageEvent {
+            account_id: "acct_123".to_string(),
+            mesh_id: "mesh-cloud".to_string(),
+            node_id: "node-1".to_string(),
+            event_type: event_type.to_string(),
+            timestamp: crate::util::now_ts(),
+        }
+    }
+
+    async fn post_grant(hub_url: &str, grant: String) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{hub_url}/v1/grants/provision"))
+            .json(&serde_json::json!({
+                "grant": grant,
+                "node": "node-1",
+                "slug": "rig"
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn signed_grant(
+        key_pair: &Ed25519KeyPair,
+        audience: &str,
+        exp: i64,
+        jti: &str,
+        mesh: &str,
+    ) -> String {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "aud": audience,
+            "exp": exp,
+            "jti": jti,
+            "account_id": "acct_123",
+            "mesh_id": mesh,
+            "mesh_name": "default"
+        }))
+        .unwrap();
+        let signature = key_pair.sign(&payload);
+        format!(
+            "{GRANT_PREFIX}{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    fn test_key_pair(seed_byte: u8) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(&[seed_byte; 32]).unwrap()
+    }
+
+    fn clear_hub_env() {
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        std::env::remove_var(ISSUER_PUBKEY_ENV);
+        std::env::remove_var(CLOUD_INGEST_URL_ENV);
+        std::env::remove_var(CLOUD_INGEST_TOKEN_ENV);
+        std::env::remove_var(HUB_URL_ENV);
+        std::env::remove_var(CLOUD_API_URL_ENV);
+        std::env::remove_var(API_KEY_ENV);
+        std::env::remove_var(CLOUD_API_KEY_ENV);
+        std::env::remove_var(HOSTED_HUB_URL_ENV);
     }
 
     fn env_lock() -> &'static TokioMutex<()> {

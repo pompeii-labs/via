@@ -1,4 +1,4 @@
-["TCREATE","meshes","id STR UNIQUE,","name STR,","created INT,","updated INT"]
+["TCREATE","meshes","id STR UNIQUE,","name STR,","account STR,","created INT,","updated INT"]
 ["TCREATE","nodes","id STR UNIQUE,","mesh STR,","name STR,","slug STR,","os STR,","arch STR,","ver STR,","seen INT,","status STR"]
 ["TCREATE","tokens","id STR UNIQUE,","mesh STR,","hash STR UNIQUE,","kind STR,","node STR,","name STR,","exp INT,","used BOOL,","created INT"]
 ["TCREATE","sessions","id STR UNIQUE,","mesh STR,","node STR,","started INT,","seen INT,","addr STR"]

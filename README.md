@@ -118,7 +118,16 @@ The hub is a relay, not a command authority. CLI requests and daemon responses a
 
 Hub HTTP and WebSocket calls require per-node hub tokens. Invite tokens are single-use registration credentials; after `via join`, the hub returns a node token and stores only its hash.
 
-When `VIA_HUB_ADMIN_TOKEN` is set on the hub process, admin endpoints require `Authorization: Bearer <token>`. The CLI sends this header automatically when the same env var is set locally.
+Via supports two hub control models:
+
+- **Self-hosted/OSS hub:** the hub has zero cloud dependency. Admin endpoints are protected by `VIA_HUB_ADMIN_TOKEN` when that env var is set on the hub process, and the CLI sends `Authorization: Bearer <token>` when the same env var is set locally.
+- **Hosted Pompeii Labs hub:** the CLI authenticates to the cloud API with a Via API key, the cloud API validates the account and returns a short-lived signed Ed25519 grant, and the hub verifies that grant offline before provisioning the mesh/node token. The hub only needs the issuer public key; the Ed25519 private signing key lives only in the cloud API.
+
+Hosted hub provisioning is intentionally a narrow trust seam. The cloud API is the account/billing gate; the hub remains a dumb relay that can verify grants locally without calling the cloud API on the hot path. Grants are versioned, audience-bound to the hub URL, mesh/account-bound, expire quickly, include a `jti`/nonce, and are rejected on replay while the hub process is running.
+
+Hosted/cloud hubs can also report node and session usage to the cloud API. Set `VIA_HUB_CLOUD_INGEST_URL` to the cloud ingest endpoint and `VIA_HUB_CLOUD_INGEST_TOKEN` to a dedicated service credential. This is optional for self-hosted/OSS hubs; when either variable is unset, the hub emits no cloud usage events.
+
+The cloud ingest path is asynchronous and batched. Hub events contain node lifecycle metadata (`account_id`, `mesh_id`, `node_id`, `event_type`, `timestamp`) for node-hours and dashboard liveness; command payloads remain end-to-end encrypted opaque frames and are not metered or inspected by the hub.
 
 SSH is used only for bootstrap in `via add`. After a node joins, day-to-day control happens over Via RPC.
 
@@ -200,21 +209,24 @@ via hub start --bind 127.0.0.1:47820
 Point a mesh at a hub:
 
 ```bash
+export VIA_HUB_ADMIN_TOKEN='<long-random-token>'
 via hub use http://127.0.0.1:47820
 via hub status
 via start
 ```
 
 `via hub use` registers the local node with the hub and stores a node token in `~/.via/hub.json`.
-Use `via hub use hosted` for the hosted Pompeii Labs hub, or pass a full URL for a self-hosted hub.
+Pass a full URL for a self-hosted hub. Use `VIA_HUB_ADMIN_TOKEN` locally when the self-hosted hub requires admin auth.
 
-For a hosted hub, set the same admin token locally when creating the first mesh or invites:
+Use the hosted Pompeii Labs hub:
 
 ```bash
-export VIA_HUB_ADMIN_TOKEN='<long-random-token>'
+export VIA_API_KEY='<via-api-key>'
 via hub use hosted
-via invite create --name rig
+via hub status
 ```
+
+`via hub use hosted` defaults to `https://api.via.pompeiilabs.com` and `https://hub.via.pompeiilabs.com`. Override them with `VIA_CLOUD_API_URL` and `VIA_HOSTED_HUB_URL` for staging. The CLI also accepts `VIA_CLOUD_API_KEY` as a compatibility alias for `VIA_API_KEY`.
 
 Create an invite for another node:
 
@@ -244,6 +256,93 @@ Use hidden diagnostic flags such as `--route hub` only when testing a specific t
 Hub schema lives in Lux migrations under `lux/migrations/`. Table and column names intentionally stay short: `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
 
 `via nodes` includes nodes discovered through the hub when hub routing is configured.
+
+## Hosted Cloud Contract
+
+The Via hub and Via Cloud stay separate services. The cloud API owns account validation, API keys, grant signing, usage ingest, and dashboard state. The Rust hub owns encrypted relay, node tokens, invite tokens, and offline grant verification.
+
+### CLI to cloud to hub
+
+For the hosted hub, the CLI sends `POST /api/hub/provision` to the cloud API with `Authorization: Bearer <via-api-key>` and this JSON body:
+
+```json
+{
+  "hub_url": "https://hub.via.pompeiilabs.com",
+  "mesh_id": "mesh_...",
+  "mesh_name": "default",
+  "node_id": "node_...",
+  "node_slug": "laptop"
+}
+```
+
+The cloud API returns `grant` or `signed_grant`. The CLI forwards that value to the hub with `POST /v1/grants/provision`:
+
+```json
+{
+  "grant": "viahub1.<payload>.<signature>",
+  "node_id": "node_...",
+  "node_slug": "laptop"
+}
+```
+
+The grant payload is base64url JSON signed with Ed25519 and currently includes:
+
+```json
+{
+  "v": 1,
+  "aud": "https://hub.via.pompeiilabs.com",
+  "exp": 1760000000,
+  "jti": "unique-grant-id",
+  "account_id": "acct_...",
+  "mesh_id": "mesh_...",
+  "mesh_name": "default"
+}
+```
+
+The hub verifies the Ed25519 signature with `VIA_HUB_ISSUER_PUBKEY`, checks version, expiry, audience, account/mesh presence, and in-process `jti` replay before minting the per-node hub token. If `VIA_HUB_ISSUER_PUBKEY` is unset, `/v1/grants/provision` is disabled and the self-hosted admin-token flow remains unchanged.
+
+### Hub to cloud ingest
+
+When configured, the hub batches node lifecycle events to the cloud ingest URL with `Authorization: Bearer <service-token>`:
+
+```json
+{
+  "events": [
+    {
+      "account_id": "acct_...",
+      "mesh_id": "mesh_...",
+      "node_id": "node_...",
+      "event_type": "connect",
+      "timestamp": 1760000000
+    }
+  ]
+}
+```
+
+The cloud API should treat this stream as the source of truth for hosted node liveness and make ingest idempotent. The dashboard reads the cloud-side `nodes`/`node_status` state derived from these events.
+
+### Environment variables
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `VIA_API_KEY` | CLI | Via Cloud API key for `via hub use hosted`. Sent as a bearer token to the cloud API only. |
+| `VIA_CLOUD_API_KEY` | CLI | Compatibility alias for `VIA_API_KEY`. |
+| `VIA_CLOUD_API_URL` | CLI | Override the cloud API base URL; defaults to `https://api.via.pompeiilabs.com`. |
+| `VIA_HOSTED_HUB_URL` | CLI | Override the hosted hub URL; defaults to `https://hub.via.pompeiilabs.com`. |
+| `VIA_HUB_ADMIN_TOKEN` | Hub/CLI | Self-hosted admin bearer token for mesh creation, invite creation, and direct node registration. Not used for hosted cloud account gating. |
+| `VIA_HUB_ISSUER_PUBKEY` | Hub | Base64 Ed25519 public key used to verify cloud-issued grants offline. Leave unset for pure self-hosted hubs. |
+| `VIA_HUB_URL` | Hub | Canonical public hub URL used for grant audience checks, especially behind a proxy. |
+| `VIA_HUB_CLOUD_INGEST_URL` | Hub | Cloud API endpoint that receives batched usage/lifecycle events. |
+| `VIA_HUB_CLOUD_INGEST_TOKEN` | Hub | Dedicated service bearer token for cloud ingest. Do not reuse API keys or admin tokens. |
+
+The Ed25519 grant signing private key is a cloud API secret only. Do not put it in hub config, CLI config, repo docs, or self-hosted examples.
+
+### Deferred / follow-ups
+
+- JWKS/key rotation is deliberately deferred; rotate the static Ed25519 issuer key manually until JWKS is added.
+- Command-level metering is deliberately deferred because hub RPC frames are end-to-end encrypted and opaque.
+- Grant replay tracking is in-process and bounded by grant expiry; keep hosted grants short-lived.
+- Self-hosted hubs remain fully functional with only admin-token auth and no cloud env vars.
 
 ## Daily Operations
 
