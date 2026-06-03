@@ -64,10 +64,21 @@ via update --all
 Connect LAN machines and off-LAN servers through a hub:
 
 ```bash
-via hub use https://hub.via.pompeiilabs.com
+via hub use hosted
+via hub status
 via invite create --name jack-laptop
 via start
-via exec rig --route hub -- hostname
+via exec rig -- hostname
+```
+
+Once a hub is configured, normal commands automatically try direct daemon access first and fall back to the hub when needed. `--route direct` and `--route hub` still exist as diagnostic flags, but they are not part of the daily path.
+
+Move files between named nodes:
+
+```bash
+via move ./dist/app rig:/srv/app
+via move rig:/var/log/app.log ./logs/rig.log
+via move pi:/etc/pihole/custom.list rig:/backups/pihole.list
 ```
 
 ## Concepts
@@ -183,23 +194,25 @@ VIA_HUB_ADMIN_TOKEN='<long-random-token>' via hub start --bind 127.0.0.1:47820 -
 For local development you can combine both:
 
 ```bash
-via hub start --bind 127.0.0.1:47820 --migrate
+via hub start --bind 127.0.0.1:47820
 ```
 
 Point a mesh at a hub:
 
 ```bash
 via hub use http://127.0.0.1:47820
+via hub status
 via start
 ```
 
 `via hub use` registers the local node with the hub and stores a node token in `~/.via/hub.json`.
+Use `via hub use hosted` for the hosted Pompeii Labs hub, or pass a full URL for a self-hosted hub.
 
 For a hosted hub, set the same admin token locally when creating the first mesh or invites:
 
 ```bash
 export VIA_HUB_ADMIN_TOKEN='<long-random-token>'
-via hub use https://hub.via.pompeiilabs.com
+via hub use hosted
 via invite create --name rig
 ```
 
@@ -218,13 +231,15 @@ via start
 
 The `via1...` invite is single-use. `via join` exchanges it with the hub for a node token before writing local mesh state.
 
-Force hub routing when testing NAT behavior:
+Normal commands automatically use the hub as fallback when direct daemon access fails:
 
 ```bash
-via node ping pi --route hub
-via exec pi --route hub -- uptime
-via deploy nginx:latest --to pi --name web --route hub --port 18080:80
+via node ping pi
+via exec pi -- uptime
+via deploy nginx:latest --to pi --name web --port 18080:80
 ```
+
+Use hidden diagnostic flags such as `--route hub` only when testing a specific transport.
 
 Hub schema lives in Lux migrations under `lux/migrations/`. Table and column names intentionally stay short: `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
 
@@ -236,7 +251,13 @@ Run a command on a node:
 
 ```bash
 via exec rig -- sh -lc 'hostname && uptime'
-via exec rig --route hub -- uptime
+```
+
+Copy files directly between nodes:
+
+```bash
+via move ./dist/app rig:/srv/app
+via move pi:/etc/pihole/custom.list rig:/backups/pihole.list
 ```
 
 Inspect services:
@@ -299,15 +320,19 @@ Updating installs the new binary. Restart running daemons after updating so long
 | `via add rig` | Bootstrap a machine over SSH and join it to the mesh. |
 | `via start` | Start the local daemon in the background. |
 | `via daemon` | Run the daemon in the foreground. |
-| `via hub use <url>` | Configure this mesh to use a hub. |
-| `via hub start --migrate` | Run a self-hosted hub and apply Lux migrations. |
+| `via hub use hosted` | Configure this mesh to use the hosted Via hub. |
+| `via hub status` | Show the active hub, auth state, and connected nodes. |
+| `via hub list` | Show the one active hub configured for this mesh. |
+| `via hub drop` | Disconnect this node from the active hub. |
+| `via hub start` | Run a self-hosted hub and apply Lux migrations. |
 | `via invite create --name pi` | Create a join token for another node. |
 | `via join <token>` | Join a mesh from an invite token. |
 | `via doctor` | Check local state, mesh key, Docker, and node daemon reachability. |
 | `via nodes` | List mesh nodes. |
-| `via node ping rig --route hub` | Check one node over a specific route. |
-| `via exec rig --route hub -- <cmd>` | Run a command on a node through Via RPC. |
-| `via deploy <image> --to rig --name web --route hub` | Deploy a Docker image. |
+| `via node ping rig` | Check one node using automatic routing. |
+| `via exec rig -- <cmd>` | Run a command on a node through Via RPC. |
+| `via move ./file rig:/tmp/file` | Copy files directly between local paths and named nodes. |
+| `via deploy <image> --to rig --name web` | Deploy a Docker image. |
 | `via ps` | Show services with live container status. |
 | `via services` | Show recorded service state. |
 | `via logs web` | Read service logs. |

@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 const INIT_HUB: &str = include_str!("../lux/migrations/20260602000000_init_hub.lux");
 const ADMIN_TOKEN_ENV: &str = "VIA_HUB_ADMIN_TOKEN";
+const HOSTED_HUB_URL: &str = "https://hub.via.pompeiilabs.com";
 const TABLES: &[&str] = &[
     "meshes", "nodes", "tokens", "sessions", "cmds", "events", "audit",
 ];
@@ -175,8 +176,8 @@ pub fn save_config(paths: &ViaPaths, config: &HubConfig) -> Result<()> {
 }
 
 pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<()> {
-    let url = normalize_http_url(&url)?;
-    let mut token = load_config(paths)?.and_then(|config| config.token);
+    let url = normalize_hub_ref(&url)?;
+    let mut token = None;
     if let Some(mesh) = state.mesh().await? {
         let local = state.local_node().await?;
         let client = reqwest::Client::new();
@@ -188,20 +189,18 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
             .send()
             .await?
             .error_for_status()?;
-        if token.is_none() {
-            let response = admin_request(client.post(format!("{url}/v1/nodes/register")))
-                .json(&RegisterNodeRequest {
-                    mesh: state.mesh().await?.expect("mesh checked above").id,
-                    node: local.id,
-                    slug: local.slug,
-                })
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<AuthResponse>()
-                .await?;
-            token = Some(response.token);
-        }
+        let response = admin_request(client.post(format!("{url}/v1/nodes/register")))
+            .json(&RegisterNodeRequest {
+                mesh: state.mesh().await?.expect("mesh checked above").id,
+                node: local.id,
+                slug: local.slug,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<AuthResponse>()
+            .await?;
+        token = Some(response.token);
     }
     save_config(
         paths,
@@ -211,6 +210,64 @@ pub async fn use_hub(state: &ViaState, paths: &ViaPaths, url: String) -> Result<
         },
     )?;
     println!("Via hub set to {url}.");
+    Ok(())
+}
+
+pub async fn status(state: &ViaState) -> Result<()> {
+    let Some(config) = load_config(state.paths())? else {
+        println!("hub: none");
+        return Ok(());
+    };
+    println!("hub: {}", config.url);
+    let mesh = state
+        .mesh()
+        .await?
+        .ok_or_else(|| anyhow!("run `via init` first"))?;
+    println!("mesh: {}", mesh.id);
+    let local = state.local_node().await?;
+    println!("node: {}", local.slug);
+    if config.token.is_none() {
+        println!("auth: missing token");
+        return Ok(());
+    }
+    match nodes(state).await {
+        Ok(nodes) => {
+            println!("auth: ok");
+            let connected = nodes.iter().filter(|node| node.status == "online").count();
+            let daemon = nodes
+                .iter()
+                .find(|node| node.slug == local.slug)
+                .map(|node| node.status.as_str())
+                .unwrap_or("unknown");
+            println!("daemon: {daemon}");
+            println!("nodes: {connected}/{} connected", nodes.len());
+        }
+        Err(error) => {
+            println!("auth: failed");
+            println!("error: {error}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn list(state: &ViaState) -> Result<()> {
+    let Some(config) = load_config(state.paths())? else {
+        println!("No hub configured.");
+        return Ok(());
+    };
+    println!("{:<8} URL", "ACTIVE");
+    println!("{:<8} {}", "yes", config.url);
+    Ok(())
+}
+
+pub fn drop_hub(paths: &ViaPaths) -> Result<()> {
+    if paths.hub_config.exists() {
+        std::fs::remove_file(&paths.hub_config)
+            .with_context(|| format!("failed to remove {}", paths.hub_config.display()))?;
+        println!("Via hub disconnected for this node.");
+    } else {
+        println!("No hub configured.");
+    }
     Ok(())
 }
 
@@ -348,7 +405,7 @@ pub async fn nodes(state: &ViaState) -> Result<Vec<HubNode>> {
         .ok_or_else(|| anyhow!("run `via init` first"))?;
     let local = state.local_node().await?;
     let client = reqwest::Client::new();
-    Ok(client
+    let response = client
         .get(format!("{}/v1/nodes", config.url))
         .query(&NodesQuery {
             mesh: mesh.id,
@@ -356,10 +413,13 @@ pub async fn nodes(state: &ViaState) -> Result<Vec<HubNode>> {
             token,
         })
         .send()
-        .await?
-        .error_for_status()?
-        .json::<Vec<HubNode>>()
-        .await?)
+        .await
+        .context("hub node discovery request failed")?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("hub node discovery failed with status {status}");
+    }
+    Ok(response.json::<Vec<HubNode>>().await?)
 }
 
 pub async fn node_by_slug(state: &ViaState, slug: &str) -> Result<Option<Node>> {
@@ -744,6 +804,13 @@ fn normalize_http_url(raw: &str) -> Result<String> {
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(&path);
     Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn normalize_hub_ref(raw: &str) -> Result<String> {
+    match raw {
+        "hosted" | "via" | "default" => Ok(HOSTED_HUB_URL.to_string()),
+        _ => normalize_http_url(raw),
+    }
 }
 
 fn decode_invite(token: &str) -> Result<InviteToken> {
@@ -1186,9 +1253,10 @@ fn parse_migration(raw: &str) -> Result<Vec<Vec<String>>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        call_node, decode_invite, hash_token, parse_migration, save_config, start, AuthResponse,
-        CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken, JoinRequest, PostCmdRequest,
-        RegisterNodeRequest, ADMIN_TOKEN_ENV, INIT_HUB, TABLES,
+        call_node, decode_invite, hash_token, normalize_hub_ref, parse_migration, save_config,
+        start, AuthResponse, CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken,
+        JoinRequest, PostCmdRequest, RegisterNodeRequest, ADMIN_TOKEN_ENV, HOSTED_HUB_URL,
+        INIT_HUB, TABLES,
     };
     use crate::model::{Mesh, Node};
     use crate::paths::ViaPaths;
@@ -1242,6 +1310,17 @@ mod tests {
         let hash = hash_token("super-secret");
         assert_ne!(hash, "super-secret");
         assert_eq!(hash, hash_token("super-secret"));
+    }
+
+    #[test]
+    fn hosted_hub_aliases_resolve_to_hosted_url() {
+        assert_eq!(normalize_hub_ref("hosted").unwrap(), HOSTED_HUB_URL);
+        assert_eq!(normalize_hub_ref("via").unwrap(), HOSTED_HUB_URL);
+        assert_eq!(normalize_hub_ref("default").unwrap(), HOSTED_HUB_URL);
+        assert_eq!(
+            normalize_hub_ref("https://hub.example.com").unwrap(),
+            "https://hub.example.com"
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ Use Via for:
 - Treat `via exec <node> -- <cmd>` as remote shell access.
 - Do not print secret values.
 - Do not expose the Via daemon to the public internet.
-- Prefer `--route hub` over exposing daemon ports when a node is off-LAN.
+- Let Via auto-route through the hub when a node is off-LAN. Use `--route hub` only for diagnostics.
 - Do not delete services or nodes unless the user requested that action.
 - Use `via ps`, `via status`, and `via logs` before making service changes when context is unclear.
 - Use `via update --check` before `via update` or `via update --all`.
@@ -43,7 +43,6 @@ Run a node command:
 
 ```bash
 via exec rig -- uptime
-via exec rig --route hub -- uptime
 via exec rig -- sh -lc 'docker ps'
 ```
 
@@ -51,14 +50,21 @@ Deploy a container:
 
 ```bash
 via deploy nginx:latest --to rig --name web --port 18080:80
-via deploy nginx:latest --to rig --name web --route hub --port 18080:80
+```
+
+Move files directly:
+
+```bash
+via move ./dist/app rig:/srv/app
+via move pi:/etc/pihole/custom.list rig:/backups/pihole.list
 ```
 
 Configure hub routing:
 
 ```bash
 export VIA_HUB_ADMIN_TOKEN='<token-if-hosted-hub-requires-it>'
-via hub use https://hub.via.pompeiilabs.com
+via hub use hosted
+via hub status
 via invite create --name pi
 via join <token>
 via start

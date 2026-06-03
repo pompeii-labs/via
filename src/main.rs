@@ -28,10 +28,10 @@ async fn main() -> Result<()> {
                 HubCommand::Start {
                     bind,
                     lux_dir,
-                    migrate,
+                    migrate: _,
                 },
         } => {
-            hub::start(bind.clone(), lux_dir.clone(), *migrate).await?;
+            hub::start(bind.clone(), lux_dir.clone(), true).await?;
             return Ok(());
         }
         Command::Hub {
@@ -76,6 +76,15 @@ async fn main() -> Result<()> {
         Command::Hub { command } => match command {
             HubCommand::Use { url } => {
                 hub::use_hub(&state, &paths, url).await?;
+            }
+            HubCommand::Status => {
+                hub::status(&state).await?;
+            }
+            HubCommand::List => {
+                hub::list(&state).await?;
+            }
+            HubCommand::Drop => {
+                hub::drop_hub(&paths)?;
             }
             HubCommand::Start { .. } | HubCommand::Migrate { .. } => {
                 unreachable!("hub server commands are handled before state initialization")
@@ -156,6 +165,9 @@ async fn main() -> Result<()> {
         } => {
             commands::exec(&mut state, node, route, command).await?;
         }
+        Command::Move { from, to } => {
+            commands::move_path(&mut state, from, to).await?;
+        }
         Command::Open { service } => {
             commands::open(&state, service).await?;
         }
@@ -197,7 +209,7 @@ pub(crate) mod commands {
     use crate::state::ViaState;
     use crate::util::{format_ts, normalize_slug, now_ts};
     use anyhow::{anyhow, bail, Context, Result};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use uuid::Uuid;
 
@@ -293,7 +305,7 @@ pub(crate) mod commands {
             id: node_id,
             slug: slug.clone(),
             display_name: ssh_host.clone(),
-            addresses: vec![ssh_host],
+            addresses: vec![ssh_host.clone()],
             daemon_addr,
             public,
             created_at: now_ts(),
@@ -311,6 +323,7 @@ pub(crate) mod commands {
             )
             .await?;
         sync_all(state).await?;
+        configure_hub_for_added_node(paths, &ssh_host).await?;
         println!(
             "{} node '{}'.",
             if existing.is_some() {
@@ -320,6 +333,29 @@ pub(crate) mod commands {
             },
             slug
         );
+        Ok(())
+    }
+
+    async fn configure_hub_for_added_node(paths: &ViaPaths, ssh_host: &str) -> Result<()> {
+        let Some(config) = crate::hub::load_config(paths)? else {
+            return Ok(());
+        };
+        let Ok(admin_token) = std::env::var("VIA_HUB_ADMIN_TOKEN") else {
+            eprintln!(
+                "warning: hub is configured locally, but VIA_HUB_ADMIN_TOKEN is not set; run `via hub use {}` on '{}' to enable hub fallback",
+                config.url, ssh_host
+            );
+            return Ok(());
+        };
+        if admin_token.is_empty() {
+            return Ok(());
+        }
+        let command = format!(
+            "VIA_HUB_ADMIN_TOKEN={} ~/.via/bin/via hub use {}",
+            shell_quote(&admin_token),
+            shell_quote(&config.url)
+        );
+        crate::ssh::remote(ssh_host, &command)?;
         Ok(())
     }
 
@@ -493,7 +529,11 @@ pub(crate) mod commands {
             return Ok(());
         }
         call_node(state, &node, crate::rpc::RpcRequest::Ping, route).await?;
-        println!("Node '{}' is reachable via {:?}.", node.slug, route);
+        match route {
+            RouteMode::Auto => println!("Node '{}' is reachable.", node.slug),
+            RouteMode::Direct => println!("Node '{}' is reachable via direct route.", node.slug),
+            RouteMode::Hub => println!("Node '{}' is reachable via hub.", node.slug),
+        }
         Ok(())
     }
 
@@ -604,7 +644,7 @@ pub(crate) mod commands {
         for service in services {
             let service = resolve_service_node_addr(state, service).await?;
             let local = state.local_node().await?.id == service.node_id;
-            let actual = container_status(&service, local)
+            let actual = container_status(state, &service, local)
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
             println!(
@@ -687,7 +727,26 @@ pub(crate) mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         let service = resolve_service_node_addr(state, service).await?;
-        docker::logs(&service, local, follow).await
+        if local {
+            return docker::logs(&service, true, follow).await;
+        }
+        match call_node(
+            state,
+            &service_node(state, &service).await?,
+            crate::rpc::RpcRequest::Logs {
+                container: service.container,
+                follow,
+            },
+            RouteMode::Auto,
+        )
+        .await?
+        {
+            crate::rpc::RpcResponse::Logs { output } => {
+                print!("{output}");
+                Ok(())
+            }
+            other => bail!("unexpected logs response: {other:?}"),
+        }
     }
 
     pub async fn stop(state: &mut ViaState, service: String) -> Result<()> {
@@ -697,7 +756,19 @@ pub(crate) mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         service = resolve_service_node_addr(state, service).await?;
-        docker::stop(&service, local).await?;
+        if local {
+            docker::stop(&service, true).await?;
+        } else {
+            call_node(
+                state,
+                &service_node(state, &service).await?,
+                crate::rpc::RpcRequest::Stop {
+                    container: service.container.clone(),
+                },
+                RouteMode::Auto,
+            )
+            .await?;
+        }
         service.status = ServiceStatus::Stopped;
         service.updated_at = now_ts();
         state.upsert_service(&service).await?;
@@ -714,7 +785,19 @@ pub(crate) mod commands {
             .ok_or_else(|| anyhow!("unknown service"))?;
         let local = state.local_node().await?.id == service.node_id;
         service = resolve_service_node_addr(state, service).await?;
-        docker::restart(&service, local).await?;
+        if local {
+            docker::restart(&service, true).await?;
+        } else {
+            call_node(
+                state,
+                &service_node(state, &service).await?,
+                crate::rpc::RpcRequest::Restart {
+                    container: service.container.clone(),
+                },
+                RouteMode::Auto,
+            )
+            .await?;
+        }
         service.status = ServiceStatus::Running;
         service.updated_at = now_ts();
         state.upsert_service(&service).await?;
@@ -734,11 +817,13 @@ pub(crate) mod commands {
         if local {
             docker::local_remove(&service.container)?;
         } else {
-            crate::rpc::call(
-                &service.node_addr,
+            call_node(
+                state,
+                &service_node(state, &service).await?,
                 crate::rpc::RpcRequest::Remove {
                     container: service.container.clone(),
                 },
+                RouteMode::Auto,
             )
             .await?;
         }
@@ -788,6 +873,87 @@ pub(crate) mod commands {
         state.persist().await?;
         sync_all(state).await?;
         print!("{output}");
+        Ok(())
+    }
+
+    pub async fn move_path(state: &mut ViaState, from: String, to: String) -> Result<()> {
+        let from = MoveEndpoint::parse(&from);
+        let to = MoveEndpoint::parse(&to);
+        let local = state.local_node().await?;
+        match (from, to) {
+            (MoveEndpoint::Local(src), MoveEndpoint::Remote { node, path }) => {
+                let node = resolve_node_for_route(state, &node, RouteMode::Auto).await?;
+                if node.id == local.id {
+                    copy_local_to_local(&src, Path::new(&path))?;
+                } else {
+                    run_scp(&[src.to_string_lossy().as_ref(), &remote_spec(&node, &path)?])?;
+                }
+                append_move_event(state, "local", &node.slug).await?;
+                println!("Moved {} to {}:{}.", src.display(), node.slug, path);
+            }
+            (MoveEndpoint::Remote { node, path }, MoveEndpoint::Local(dst)) => {
+                let node = resolve_node_for_route(state, &node, RouteMode::Auto).await?;
+                if node.id == local.id {
+                    copy_local_to_local(Path::new(&path), &dst)?;
+                } else {
+                    run_scp(&[&remote_spec(&node, &path)?, dst.to_string_lossy().as_ref()])?;
+                }
+                append_move_event(state, &node.slug, "local").await?;
+                println!("Moved {}:{} to {}.", node.slug, path, dst.display());
+            }
+            (
+                MoveEndpoint::Remote {
+                    node: src_node,
+                    path: src_path,
+                },
+                MoveEndpoint::Remote {
+                    node: dst_node,
+                    path: dst_path,
+                },
+            ) => {
+                let src = resolve_node_for_route(state, &src_node, RouteMode::Auto).await?;
+                let dst = resolve_node_for_route(state, &dst_node, RouteMode::Auto).await?;
+                if src.id == local.id && dst.id == local.id {
+                    copy_local_to_local(Path::new(&src_path), Path::new(&dst_path))?;
+                } else if src.id == local.id {
+                    run_scp(&[&src_path, &remote_spec(&dst, &dst_path)?])?;
+                } else if dst.id == local.id {
+                    run_scp(&[&remote_spec(&src, &src_path)?, &dst_path])?;
+                } else {
+                    let dst_spec = remote_spec(&dst, &dst_path)?;
+                    let command = format!(
+                        "scp -o BatchMode=yes -r {} {}",
+                        shell_quote(&src_path),
+                        shell_quote(&dst_spec)
+                    );
+                    match call_node(
+                        state,
+                        &src,
+                        crate::rpc::RpcRequest::Exec {
+                            command: vec!["sh".to_string(), "-lc".to_string(), command],
+                        },
+                        RouteMode::Auto,
+                    )
+                    .await?
+                    {
+                        crate::rpc::RpcResponse::Exec { output } => print!("{output}"),
+                        other => bail!("unexpected move response: {other:?}"),
+                    }
+                }
+                append_move_event(state, &src.slug, &dst.slug).await?;
+                println!(
+                    "Moved {}:{} to {}:{}.",
+                    src.slug, src_path, dst.slug, dst_path
+                );
+            }
+            (MoveEndpoint::Local(src), MoveEndpoint::Local(dst)) => {
+                copy_local_to_local(&src, &dst)?;
+                append_move_event(state, "local", "local").await?;
+                println!("Moved {} to {}.", src.display(), dst.display());
+            }
+        }
+        state.persist().await?;
+        sync_all(state).await?;
         Ok(())
     }
 
@@ -1166,15 +1332,28 @@ pub(crate) mod commands {
         Ok(service)
     }
 
-    async fn container_status(service: &crate::model::Service, local: bool) -> Result<String> {
+    async fn service_node(state: &ViaState, service: &crate::model::Service) -> Result<Node> {
+        state
+            .node_by_id(&service.node_id)
+            .await?
+            .ok_or_else(|| anyhow!("service node '{}' is missing", service.node_slug))
+    }
+
+    async fn container_status(
+        state: &ViaState,
+        service: &crate::model::Service,
+        local: bool,
+    ) -> Result<String> {
         if local {
             return docker::local_container_status(&service.container);
         }
-        match crate::rpc::call(
-            &service.node_addr,
+        match call_node(
+            state,
+            &service_node(state, service).await?,
             crate::rpc::RpcRequest::ContainerStatus {
                 container: service.container.clone(),
             },
+            RouteMode::Auto,
         )
         .await?
         {
@@ -1206,6 +1385,91 @@ pub(crate) mod commands {
         port.split(':').next().unwrap_or(port)
     }
 
+    enum MoveEndpoint {
+        Local(PathBuf),
+        Remote { node: String, path: String },
+    }
+
+    impl MoveEndpoint {
+        fn parse(raw: &str) -> Self {
+            if let Some((node, path)) = raw.split_once(':') {
+                if !node.is_empty() && !node.contains('/') {
+                    return Self::Remote {
+                        node: node.to_string(),
+                        path: path.to_string(),
+                    };
+                }
+            }
+            Self::Local(PathBuf::from(raw))
+        }
+    }
+
+    fn remote_spec(node: &Node, path: &str) -> Result<String> {
+        let host = ssh_target(node)?;
+        Ok(format!("{host}:{path}"))
+    }
+
+    fn ssh_target(node: &Node) -> Result<String> {
+        let candidate = node
+            .addresses
+            .iter()
+            .find(|address| !address.is_empty() && address.as_str() != "hub")
+            .cloned()
+            .or_else(|| {
+                node.daemon_addr
+                    .rsplit_once(':')
+                    .map(|(host, _)| host.to_string())
+            })
+            .ok_or_else(|| anyhow!("node '{}' has no SSH address for direct copy", node.slug))?;
+        if candidate == "hub" {
+            bail!("node '{}' has no direct SSH address for copy", node.slug);
+        }
+        Ok(candidate)
+    }
+
+    fn run_scp(args: &[&str]) -> Result<()> {
+        let status = ProcessCommand::new("scp")
+            .args(["-o", "BatchMode=yes", "-r"])
+            .args(args)
+            .status()
+            .context("failed to run scp")?;
+        if !status.success() {
+            bail!("scp failed with status {status}");
+        }
+        Ok(())
+    }
+
+    fn copy_local_to_local(src: &Path, dst: &Path) -> Result<()> {
+        if src.is_dir() {
+            let status = ProcessCommand::new("cp")
+                .arg("-R")
+                .arg(src)
+                .arg(dst)
+                .status()
+                .context("failed to run cp")?;
+            if !status.success() {
+                bail!("cp failed with status {status}");
+            }
+            return Ok(());
+        }
+        std::fs::copy(src, dst)
+            .with_context(|| format!("failed to copy {} to {}", src.display(), dst.display()))?;
+        Ok(())
+    }
+
+    async fn append_move_event(state: &ViaState, from: &str, to: &str) -> Result<()> {
+        state
+            .append_event("node.move", &serde_json::json!({ "from": from, "to": to }))
+            .await
+    }
+
+    fn shell_quote(value: &str) -> String {
+        if value.is_empty() {
+            return "''".to_string();
+        }
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
     fn hostname() -> Result<String> {
         let output = ProcessCommand::new("hostname")
             .output()
@@ -1219,8 +1483,8 @@ pub(crate) mod commands {
     #[cfg(test)]
     mod tests {
         use super::{
-            normalize_release_version, parse_latest_release_version, update_shell_command,
-            version_newer,
+            normalize_release_version, parse_latest_release_version, shell_quote,
+            update_shell_command, version_newer, MoveEndpoint,
         };
 
         #[test]
@@ -1254,6 +1518,28 @@ pub(crate) mod commands {
             );
             assert!(normalize_release_version("0.1.0; echo no").is_err());
             assert!(normalize_release_version("").is_err());
+        }
+
+        #[test]
+        fn move_endpoint_parses_node_specs_only_when_prefix_is_node_like() {
+            match MoveEndpoint::parse("rig:/srv/app") {
+                MoveEndpoint::Remote { node, path } => {
+                    assert_eq!(node, "rig");
+                    assert_eq!(path, "/srv/app");
+                }
+                MoveEndpoint::Local(_) => panic!("expected remote endpoint"),
+            }
+            match MoveEndpoint::parse("./weird:name") {
+                MoveEndpoint::Local(path) => assert_eq!(path.to_string_lossy(), "./weird:name"),
+                MoveEndpoint::Remote { .. } => panic!("expected local endpoint"),
+            }
+        }
+
+        #[test]
+        fn shell_quote_handles_spaces_and_quotes() {
+            assert_eq!(shell_quote("a b"), "'a b'");
+            assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+            assert_eq!(shell_quote(""), "''");
         }
     }
 }

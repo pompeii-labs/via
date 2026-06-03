@@ -230,3 +230,81 @@ fn system_log_follow_is_explicitly_rejected() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn move_copies_local_files_and_records_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let via = env!("CARGO_BIN_EXE_via");
+    let src = temp.path().join("src.txt");
+    let dst = temp.path().join("dst.txt");
+    std::fs::write(&src, "hello via move").unwrap();
+
+    let init = Command::new(via)
+        .env("HOME", temp.path())
+        .args(["init", "--name", "laptop"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let moved = Command::new(via)
+        .env("HOME", temp.path())
+        .args(["move", src.to_str().unwrap(), dst.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        moved.status.success(),
+        "move failed: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello via move");
+
+    let logs = Command::new(via)
+        .env("HOME", temp.path())
+        .arg("logs")
+        .output()
+        .unwrap();
+    assert!(
+        logs.status.success(),
+        "logs failed: {}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        stdout.contains("node.move"),
+        "unexpected logs output: {stdout}"
+    );
+}
+
+#[test]
+fn hub_list_and_drop_handle_missing_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let via = env!("CARGO_BIN_EXE_via");
+
+    let list = Command::new(via)
+        .env("HOME", temp.path())
+        .args(["hub", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "hub list failed: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(String::from_utf8_lossy(&list.stdout).contains("No hub configured."));
+
+    let drop = Command::new(via)
+        .env("HOME", temp.path())
+        .args(["hub", "drop"])
+        .output()
+        .unwrap();
+    assert!(
+        drop.status.success(),
+        "hub drop failed: {}",
+        String::from_utf8_lossy(&drop.stderr)
+    );
+    assert!(String::from_utf8_lossy(&drop.stdout).contains("No hub configured."));
+}

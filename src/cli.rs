@@ -58,7 +58,7 @@ pub enum Command {
         name: String,
         #[arg(long)]
         port: Option<String>,
-        #[arg(long, value_enum, default_value = "auto")]
+        #[arg(long, value_enum, default_value = "auto", hide = true)]
         route: RouteMode,
         #[arg(last = true)]
         command: Vec<String>,
@@ -85,10 +85,14 @@ pub enum Command {
     },
     Exec {
         node: String,
-        #[arg(long, value_enum, default_value = "auto")]
+        #[arg(long, value_enum, default_value = "auto", hide = true)]
         route: RouteMode,
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    Move {
+        from: String,
+        to: String,
     },
     Open {
         service: String,
@@ -130,7 +134,7 @@ pub enum NodeCommand {
     },
     Ping {
         node: String,
-        #[arg(long, value_enum, default_value = "auto")]
+        #[arg(long, value_enum, default_value = "auto", hide = true)]
         route: RouteMode,
     },
     Rm {
@@ -143,6 +147,9 @@ pub enum HubCommand {
     Use {
         url: String,
     },
+    Status,
+    List,
+    Drop,
     Start {
         #[arg(long, default_value = "127.0.0.1:47820")]
         bind: String,
