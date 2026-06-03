@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{interval, sleep, timeout, Duration, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use url::Url;
@@ -31,9 +31,16 @@ use uuid::Uuid;
 const INIT_HUB: &str = include_str!("../lux/migrations/20260602000000_init_hub.lux");
 const ADMIN_TOKEN_ENV: &str = "VIA_HUB_ADMIN_TOKEN";
 const ISSUER_PUBKEY_ENV: &str = "VIA_HUB_ISSUER_PUBKEY";
+const CLOUD_INGEST_URL_ENV: &str = "VIA_HUB_CLOUD_INGEST_URL";
+const CLOUD_INGEST_TOKEN_ENV: &str = "VIA_HUB_CLOUD_INGEST_TOKEN";
 const HUB_URL_ENV: &str = "VIA_HUB_URL";
 const GRANT_PREFIX: &str = "viahub1.";
 const HOSTED_HUB_URL: &str = "https://hub.via.pompeiilabs.com";
+const USAGE_EVENT_BUFFER: usize = 1024;
+const USAGE_EVENT_BATCH_SIZE: usize = 100;
+const USAGE_EVENT_INTERVAL: Duration = Duration::from_secs(10);
+const USAGE_EVENT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const USAGE_EVENT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const TABLES: &[&str] = &[
     "meshes", "nodes", "tokens", "sessions", "cmds", "events", "audit",
 ];
@@ -186,10 +193,54 @@ struct HubRuntime {
     admin_token: Option<String>,
     issuer_pubkey: Option<Vec<u8>>,
     hub_url: Option<String>,
+    usage_reporter: Option<UsageReporter>,
     sessions: Mutex<HashMap<SessionKey, mpsc::Sender<HubToAgent>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     results: Mutex<HashMap<String, CmdResponse>>,
     seen_grants: Mutex<HashMap<String, i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UsageEvent {
+    account_id: String,
+    mesh_id: String,
+    node_id: String,
+    event_type: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageEventBatch {
+    events: Vec<UsageEvent>,
+}
+
+#[derive(Clone)]
+struct UsageReporter {
+    tx: mpsc::Sender<UsageEvent>,
+}
+
+impl UsageReporter {
+    fn from_env() -> Option<Self> {
+        let url = std::env::var(CLOUD_INGEST_URL_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let token = std::env::var(CLOUD_INGEST_TOKEN_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        Some(spawn_usage_reporter(
+            url,
+            token,
+            USAGE_EVENT_INTERVAL,
+            USAGE_EVENT_BATCH_SIZE,
+            USAGE_EVENT_BUFFER,
+        ))
+    }
+
+    fn enqueue(&self, event: UsageEvent) {
+        if let Err(error) = self.tx.try_send(event) {
+            eprintln!("via hub usage event dropped: {error}");
+        }
+    }
 }
 
 pub fn configured(paths: &ViaPaths) -> bool {
@@ -501,17 +552,22 @@ pub async fn start(bind: String, lux_dir: Option<String>, migrate: bool) -> Resu
     } else {
         db.check_schema().await?;
     }
+    let issuer_pubkey = load_issuer_pubkey()?;
+    let usage_reporter = issuer_pubkey
+        .as_ref()
+        .and_then(|_| UsageReporter::from_env());
     let runtime = Arc::new(HubRuntime {
         db,
         admin_token: std::env::var(ADMIN_TOKEN_ENV)
             .ok()
             .filter(|token| !token.is_empty()),
-        issuer_pubkey: load_issuer_pubkey()?,
+        issuer_pubkey,
         hub_url: std::env::var(HUB_URL_ENV)
             .ok()
             .filter(|url| !url.is_empty())
             .map(|url| normalize_http_url(&url))
             .transpose()?,
+        usage_reporter,
         sessions: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
@@ -771,6 +827,13 @@ async fn handle_agent(mut socket: WebSocket, runtime: Arc<HubRuntime>, query: Ag
     let _ = runtime.db.insert_node(&query).await;
     let session_id = Uuid::new_v4().to_string();
     let _ = runtime.db.insert_session(&session_id, &query).await;
+    emit_cloud_usage_events(
+        &runtime,
+        &query.mesh,
+        &query.node,
+        &["connected", "session_started"],
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -804,7 +867,139 @@ async fn handle_agent(mut socket: WebSocket, runtime: Arc<HubRuntime>, query: Ag
         .sessions
         .lock()
         .await
-        .remove(&(query.mesh, query.slug));
+        .remove(&(query.mesh.clone(), query.slug));
+    let _ = runtime.db.mark_node_offline(&query.mesh, &query.node).await;
+    emit_cloud_usage_events(
+        &runtime,
+        &query.mesh,
+        &query.node,
+        &["session_ended", "disconnected"],
+    )
+    .await;
+}
+
+async fn emit_cloud_usage_events(
+    runtime: &HubRuntime,
+    mesh: &str,
+    node: &str,
+    event_types: &[&str],
+) {
+    let Some(reporter) = runtime.usage_reporter.as_ref() else {
+        return;
+    };
+    let account = match runtime.db.mesh_account(mesh).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("via hub usage event skipped: {error}");
+            return;
+        }
+    };
+    let timestamp = now_ts();
+    for event_type in event_types {
+        reporter.enqueue(UsageEvent {
+            account_id: account.clone(),
+            mesh_id: mesh.to_string(),
+            node_id: node.to_string(),
+            event_type: (*event_type).to_string(),
+            timestamp,
+        });
+    }
+}
+
+fn spawn_usage_reporter(
+    url: String,
+    token: String,
+    flush_interval: Duration,
+    batch_size: usize,
+    buffer_size: usize,
+) -> UsageReporter {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    tokio::spawn(run_usage_reporter(
+        reqwest::Client::new(),
+        url,
+        token,
+        flush_interval,
+        batch_size,
+        buffer_size,
+        rx,
+    ));
+    UsageReporter { tx }
+}
+
+async fn run_usage_reporter(
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    flush_interval: Duration,
+    batch_size: usize,
+    max_pending: usize,
+    mut rx: mpsc::Receiver<UsageEvent>,
+) {
+    let mut ticker = interval(flush_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut pending = Vec::new();
+    let mut backoff = USAGE_EVENT_BACKOFF_INITIAL;
+    loop {
+        tokio::select! {
+            Some(event) = rx.recv() => {
+                if pending.len() >= max_pending {
+                    eprintln!("via hub usage retry buffer full; event dropped");
+                } else {
+                    pending.push(event);
+                }
+                while pending.len() < batch_size {
+                    match rx.try_recv() {
+                        Ok(event) if pending.len() < max_pending => pending.push(event),
+                        Ok(_) => eprintln!("via hub usage retry buffer full; event dropped"),
+                        Err(_) => break,
+                    }
+                }
+                if pending.len() >= batch_size && post_usage_batch(&client, &url, &token, &pending).await.is_ok() {
+                    pending.clear();
+                    backoff = USAGE_EVENT_BACKOFF_INITIAL;
+                }
+            }
+            _ = ticker.tick() => {
+                if pending.is_empty() {
+                    continue;
+                }
+                match post_usage_batch(&client, &url, &token, &pending).await {
+                    Ok(()) => {
+                        pending.clear();
+                        backoff = USAGE_EVENT_BACKOFF_INITIAL;
+                    }
+                    Err(error) => {
+                        eprintln!("via hub usage ingest failed: {error}");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(USAGE_EVENT_BACKOFF_MAX);
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+}
+
+async fn post_usage_batch(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    events: &[UsageEvent],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    client
+        .post(url)
+        .bearer_auth(token)
+        .json(&UsageEventBatch {
+            events: events.to_vec(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 async fn agent_loop(config: HubConfig, mesh: Mesh, node: Node, tx: mpsc::Sender<HubAgentRpc>) {
@@ -1196,6 +1391,19 @@ impl HubDb {
         self.persist().await
     }
 
+    async fn mesh_account(&self, mesh: &str) -> Result<Option<String>> {
+        let row = self
+            .select_rows("meshes", &["WHERE", "id", "=", mesh, "LIMIT", "1"])
+            .await?
+            .into_iter()
+            .next();
+        Ok(row.and_then(|row| {
+            field(&row, "account")
+                .filter(|account| !account.is_empty())
+                .map(str::to_string)
+        }))
+    }
+
     async fn claim_invite(
         &self,
         mesh: &str,
@@ -1300,7 +1508,31 @@ impl HubDb {
                 ("status", "online"),
             ],
         )
-        .await
+        .await?;
+        self.client
+            .execute(
+                "TUPDATE",
+                &[
+                    "nodes", "SET", "seen", &seen, "status", "online", "WHERE", "id", "=",
+                    node,
+                ],
+            )
+            .await?;
+        self.persist().await
+    }
+
+    async fn mark_node_offline(&self, _mesh: &str, node: &str) -> Result<()> {
+        let seen = now_ts().to_string();
+        self.client
+            .execute(
+                "TUPDATE",
+                &[
+                    "nodes", "SET", "seen", &seen, "status", "offline", "WHERE", "id", "=",
+                    node,
+                ],
+            )
+            .await?;
+        self.persist().await
     }
 
     async fn nodes(&self, mesh: &str) -> Result<Vec<HubNode>> {
@@ -1472,9 +1704,12 @@ fn parse_migration(raw: &str) -> Result<Vec<Vec<String>>> {
 mod tests {
     use super::{
         call_node, decode_invite, hash_token, normalize_hub_ref, parse_migration, save_config,
-        start, AuthResponse, CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken,
-        JoinRequest, PostCmdRequest, RegisterNodeRequest, ADMIN_TOKEN_ENV, GRANT_PREFIX,
-        HOSTED_HUB_URL, HUB_URL_ENV, INIT_HUB, ISSUER_PUBKEY_ENV, TABLES,
+        emit_cloud_usage_events, post_usage_batch, spawn_usage_reporter, start, AuthResponse,
+        CreateMeshRequest, CreateTokenRequest, HubConfig, HubDb, HubRuntime, InviteToken,
+        JoinRequest, PostCmdRequest, RegisterNodeRequest, UsageEvent, UsageEventBatch,
+        ADMIN_TOKEN_ENV, CLOUD_INGEST_TOKEN_ENV,
+        CLOUD_INGEST_URL_ENV, GRANT_PREFIX, HOSTED_HUB_URL, HUB_URL_ENV, INIT_HUB,
+        ISSUER_PUBKEY_ENV, TABLES,
     };
     use crate::model::{Mesh, Node};
     use crate::paths::ViaPaths;
@@ -1483,10 +1718,17 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
     use tokio::sync::Mutex as TokioMutex;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, timeout, Duration};
 
     static ENV_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
 
@@ -1967,6 +2209,137 @@ mod tests {
         assert_eq!(auth.status(), reqwest::StatusCode::NO_CONTENT);
     }
 
+
+    #[tokio::test]
+    async fn usage_events_batch_to_cloud_ingest() {
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let reporter = spawn_usage_reporter(
+            ingest.url,
+            "ingest-secret".to_string(),
+            Duration::from_millis(25),
+            2,
+            8,
+        );
+
+        reporter.enqueue(test_usage_event("connected"));
+        reporter.enqueue(test_usage_event("session_started"));
+        reporter.enqueue(test_usage_event("disconnected"));
+
+        let recorded = wait_for_batches(&batches, 2).await;
+        assert_eq!(recorded.iter().map(Vec::len).sum::<usize>(), 3);
+        assert!(recorded.iter().any(|batch| batch.len() == 2));
+        assert!(recorded.iter().any(|batch| batch.len() == 1));
+    }
+
+    #[tokio::test]
+    async fn cloud_mesh_usage_events_are_emitted() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let temp = TempDir::new().unwrap();
+        let db = HubDb::open(Some(temp.path().join("lux").to_string_lossy().to_string()))
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        db.provision_grant_mesh("mesh-cloud", Some("default"), "acct_123", "node-1", "rig")
+            .await
+            .unwrap();
+        let runtime = HubRuntime {
+            db,
+            admin_token: None,
+            issuer_pubkey: None,
+            hub_url: None,
+            usage_reporter: Some(spawn_usage_reporter(
+                ingest.url,
+                "ingest-secret".to_string(),
+                Duration::from_millis(25),
+                10,
+                8,
+            )),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+            results: tokio::sync::Mutex::new(HashMap::new()),
+            seen_grants: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        emit_cloud_usage_events(
+            &runtime,
+            "mesh-cloud",
+            "node-1",
+            &["connected", "session_started", "session_ended", "disconnected"],
+        )
+        .await;
+
+        let recorded = wait_for_batches(&batches, 1).await;
+        let events = recorded.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| event.account_id == "acct_123"));
+        assert!(events.iter().all(|event| event.mesh_id == "mesh-cloud"));
+        assert!(events.iter().all(|event| event.node_id == "node-1"));
+        assert!(events.iter().any(|event| event.event_type == "connected"));
+        assert!(events.iter().any(|event| event.event_type == "session_started"));
+        assert!(events.iter().any(|event| event.event_type == "session_ended"));
+        assert!(events.iter().any(|event| event.event_type == "disconnected"));
+    }
+
+    #[tokio::test]
+    async fn non_cloud_mesh_usage_events_are_not_emitted() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let batches = Arc::new(TokioMutex::new(Vec::<Vec<UsageEvent>>::new()));
+        let ingest = start_ingest_server(batches.clone(), axum::http::StatusCode::NO_CONTENT).await;
+        let temp = TempDir::new().unwrap();
+        let db = HubDb::open(Some(temp.path().join("lux").to_string_lossy().to_string()))
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        db.insert_mesh("mesh-oss", "default").await.unwrap();
+        db.register_node("mesh-oss", "node-1", "rig").await.unwrap();
+        let runtime = HubRuntime {
+            db,
+            admin_token: None,
+            issuer_pubkey: None,
+            hub_url: None,
+            usage_reporter: Some(spawn_usage_reporter(
+                ingest.url,
+                "ingest-secret".to_string(),
+                Duration::from_millis(25),
+                10,
+                8,
+            )),
+            sessions: tokio::sync::Mutex::new(HashMap::new()),
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+            results: tokio::sync::Mutex::new(HashMap::new()),
+            seen_grants: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        emit_cloud_usage_events(&runtime, "mesh-oss", "node-1", &["connected"]).await;
+        sleep(Duration::from_millis(75)).await;
+
+        assert!(batches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_ingest_failure_does_not_block_event_production() {
+        let event = test_usage_event("connected");
+        let started = std::time::Instant::now();
+        let result = timeout(
+            Duration::from_millis(100),
+            post_usage_batch(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/v1/hub/events",
+                "ingest-secret",
+                &[event],
+            ),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     struct GrantHub {
         url: String,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1996,6 +2369,73 @@ mod tests {
                 key_pair,
                 _temp: hub_temp,
             }
+        }
+    }
+
+
+    struct IngestServer {
+        url: String,
+        _task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn start_ingest_server(
+        batches: Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+        status: axum::http::StatusCode,
+    ) -> IngestServer {
+        async fn ingest_handler(
+            axum::extract::State((batches, status)): axum::extract::State<(
+                Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+                axum::http::StatusCode,
+            )>,
+            headers: HeaderMap,
+            Json(batch): Json<UsageEventBatch>,
+        ) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer ingest-secret")
+            );
+            batches.lock().await.push(batch.events);
+            status
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/hub/events", post(ingest_handler))
+            .with_state((batches, status));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await?;
+            Ok(())
+        });
+        IngestServer {
+            url: format!("http://{addr}/v1/hub/events"),
+            _task: task,
+        }
+    }
+
+    async fn wait_for_batches(
+        batches: &Arc<TokioMutex<Vec<Vec<UsageEvent>>>>,
+        expected: usize,
+    ) -> Vec<Vec<UsageEvent>> {
+        for _ in 0..50 {
+            let snapshot = batches.lock().await.clone();
+            if snapshot.len() >= expected {
+                return snapshot;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        batches.lock().await.clone()
+    }
+
+    fn test_usage_event(event_type: &str) -> UsageEvent {
+        UsageEvent {
+            account_id: "acct_123".to_string(),
+            mesh_id: "mesh-cloud".to_string(),
+            node_id: "node-1".to_string(),
+            event_type: event_type.to_string(),
+            timestamp: crate::util::now_ts(),
         }
     }
 
@@ -2044,6 +2484,8 @@ mod tests {
     fn clear_hub_env() {
         std::env::remove_var(ADMIN_TOKEN_ENV);
         std::env::remove_var(ISSUER_PUBKEY_ENV);
+        std::env::remove_var(CLOUD_INGEST_URL_ENV);
+        std::env::remove_var(CLOUD_INGEST_TOKEN_ENV);
         std::env::remove_var(HUB_URL_ENV);
     }
 
