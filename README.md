@@ -120,6 +120,8 @@ Hub HTTP and WebSocket calls require per-node hub tokens. Invite tokens are sing
 
 When `VIA_HUB_ADMIN_TOKEN` is set on the hub process, admin endpoints require `Authorization: Bearer <token>`. The CLI sends this header automatically when the same env var is set locally.
 
+Hosted/cloud hubs can also report node and session usage to the cloud API. Set `VIA_HUB_CLOUD_INGEST_URL` to the cloud ingest endpoint and `VIA_HUB_CLOUD_INGEST_TOKEN` to a dedicated service credential. This is optional for self-hosted/OSS hubs; when either variable is unset, the hub emits no cloud usage events.
+
 SSH is used only for bootstrap in `via add`. After a node joins, day-to-day control happens over Via RPC.
 
 ## Install
