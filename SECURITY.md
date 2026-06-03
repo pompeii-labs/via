@@ -14,12 +14,13 @@ Email **hello@pompeiilabs.com** with:
 
 ## Scope
 
-This policy covers the Via CLI, daemon, installer, release artifacts, and mesh RPC protocol.
+This policy covers the Via CLI, daemon, hub, installer, release artifacts, and mesh RPC protocol.
 
 ## What Qualifies
 
 - mesh authentication or authorization bypasses
 - RPC payload disclosure or tampering
+- hub relay plaintext access to command or response bodies
 - secret value disclosure
 - command injection in installer, bootstrap, deploy, update, or exec paths
 - unsafe default daemon exposure
@@ -27,7 +28,7 @@ This policy covers the Via CLI, daemon, installer, release artifacts, and mesh R
 
 ## Current Security Model
 
-Via currently uses a shared mesh key. A node with access to that key has mesh authority. RPC payloads are encrypted and signed, and secrets are encrypted at rest, but Via should only be used on trusted machines over private networks.
+Via currently uses a shared mesh key. A node with access to that key has mesh authority. RPC payloads are encrypted and signed before direct or hub transport, and secrets are encrypted at rest. The hub should see opaque encrypted frames, not plaintext command bodies.
 
 ## Disclosure
 

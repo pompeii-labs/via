@@ -8,7 +8,7 @@ Via is a private control plane for machines you own.
 
 It joins laptops, desktops, Raspberry Pis, Mac minis, and servers into one trusted mesh. From any node, you can inspect the mesh, run commands on another node, deploy containers, read logs, manage secrets, and update Via without handing every tool SSH keys or raw Docker access.
 
-Via is CLI-first. There is no hosted account, dashboard, or website requirement.
+Via is CLI-first. It can run entirely on a private LAN, or use a Via Hub relay so nodes behind NAT can still receive encrypted mesh commands.
 
 ## Use Cases
 
@@ -61,6 +61,15 @@ via update --check
 via update --all
 ```
 
+Connect LAN machines and off-LAN servers through a hub:
+
+```bash
+via hub use https://hub.via.pompeiilabs.com
+via invite create --name jack-laptop
+via start
+via exec rig --route hub -- hostname
+```
+
 ## Concepts
 
 **Mesh**
@@ -85,9 +94,16 @@ A secret is encrypted at rest with the mesh key and synced through mesh state. D
 
 ## Network Model
 
-Use Via on machines reachable over a private network: LAN, Tailscale, WireGuard, or a similar overlay.
+Via has two routes:
+
+- `direct`: TCP to the node daemon address, best for LAN, Tailscale, WireGuard, or similar overlays.
+- `hub`: outbound WebSocket sessions through a Via Hub, useful for machines behind NAT.
+
+`auto` tries direct first and falls back to hub when a hub is configured.
 
 Via daemons are not meant to be exposed directly to the public internet. Treat daemon reachability as administrative reachability.
+
+The hub is a relay, not a command authority. CLI requests and daemon responses are encrypted and signed with the mesh key before they reach the hub, so the hub stores and forwards opaque RPC frames.
 
 SSH is used only for bootstrap in `via add`. After a node joins, day-to-day control happens over Via RPC.
 
@@ -102,7 +118,7 @@ curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.1.0
+curl -fsSL https://raw.githubusercontent.com/pompeii-labs/via/main/install.sh | bash -s -- 0.2.0-alpha.1
 ```
 
 The installer detects OS/architecture, downloads the matching GitHub release asset, verifies the SHA-256 checksum when available, installs the binary to:
@@ -151,12 +167,58 @@ via nodes
 via node ping rig
 ```
 
+## Hub Mode
+
+Run a self-hosted hub:
+
+```bash
+via hub migrate --lux-dir /var/lib/via-hub/lux
+via hub start --bind 0.0.0.0:47820 --lux-dir /var/lib/via-hub/lux
+```
+
+For local development you can combine both:
+
+```bash
+via hub start --bind 127.0.0.1:47820 --migrate
+```
+
+Point a mesh at a hub:
+
+```bash
+via hub use http://127.0.0.1:47820
+via start
+```
+
+Create an invite for another node:
+
+```bash
+via invite create --name pi
+```
+
+Join on the other machine:
+
+```bash
+via join via1...
+via start
+```
+
+Force hub routing when testing NAT behavior:
+
+```bash
+via node ping pi --route hub
+via exec pi --route hub -- uptime
+via deploy nginx:latest --to pi --name web --route hub --port 18080:80
+```
+
+Hub schema lives in Lux migrations under `lux/migrations/`. Table and column names intentionally stay short: `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
+
 ## Daily Operations
 
 Run a command on a node:
 
 ```bash
 via exec rig -- sh -lc 'hostname && uptime'
+via exec rig --route hub -- uptime
 ```
 
 Inspect services:
@@ -219,11 +281,15 @@ Updating installs the new binary. Restart running daemons after updating so long
 | `via add rig` | Bootstrap a machine over SSH and join it to the mesh. |
 | `via start` | Start the local daemon in the background. |
 | `via daemon` | Run the daemon in the foreground. |
+| `via hub use <url>` | Configure this mesh to use a hub. |
+| `via hub start --migrate` | Run a self-hosted hub and apply Lux migrations. |
+| `via invite create --name pi` | Create a join token for another node. |
+| `via join <token>` | Join a mesh from an invite token. |
 | `via doctor` | Check local state, mesh key, Docker, and node daemon reachability. |
 | `via nodes` | List mesh nodes. |
-| `via node ping rig` | Check one node daemon. |
-| `via exec rig -- <cmd>` | Run a command on a node through Via RPC. |
-| `via deploy <image> --to rig --name web` | Deploy a Docker image. |
+| `via node ping rig --route hub` | Check one node over a specific route. |
+| `via exec rig --route hub -- <cmd>` | Run a command on a node through Via RPC. |
+| `via deploy <image> --to rig --name web --route hub` | Deploy a Docker image. |
 | `via ps` | Show services with live container status. |
 | `via services` | Show recorded service state. |
 | `via logs web` | Read service logs. |
@@ -242,6 +308,7 @@ Implemented:
 - AES-256-GCM encrypted secrets at rest.
 - AES-256-GCM encrypted RPC request and response payloads.
 - HMAC-signed RPC frames.
+- Hub relays store opaque encrypted RPC frames, not plaintext commands.
 - Timestamp validation.
 - Nonce replay rejection.
 - Unix mesh key permissions set to `0600`.
@@ -263,6 +330,7 @@ Operational boundaries:
 ```text
 ~/.via/bin/via       installed binary
 ~/.via/mesh.key      mesh key
+~/.via/hub.json      optional hub URL/token config
 ~/.via/lux/          embedded Lux state
 ~/.via/logs/         Via logs
 ~/.via/daemon.log    daemon stdout/stderr
@@ -308,8 +376,8 @@ The workflow is:
 Releases are tag-based:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0-alpha.1
+git push origin v0.2.0-alpha.1
 ```
 
 The release workflow is:
@@ -344,6 +412,7 @@ Important modules:
 - `src/main.rs`: command handlers.
 - `src/ssh.rs`: SSH bootstrap and path deploy transfer helpers.
 - `src/rpc.rs`: encrypted/signed node RPC.
+- `src/hub.rs`: Hub server, Lux migrations, invite tokens, and hub route client.
 - `src/security.rs`: mesh key, encryption, HMAC, nonce utilities.
 - `src/state.rs`: embedded Lux state model.
 - `src/docker.rs`: Docker command construction and execution.

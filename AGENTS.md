@@ -22,6 +22,7 @@ Use Via for:
 - Treat `via exec <node> -- <cmd>` as remote shell access.
 - Do not print secret values.
 - Do not expose the Via daemon to the public internet.
+- Prefer `--route hub` over exposing daemon ports when a node is off-LAN.
 - Do not delete services or nodes unless the user requested that action.
 - Use `via ps`, `via status`, and `via logs` before making service changes when context is unclear.
 - Use `via update --check` before `via update` or `via update --all`.
@@ -42,6 +43,7 @@ Run a node command:
 
 ```bash
 via exec rig -- uptime
+via exec rig --route hub -- uptime
 via exec rig -- sh -lc 'docker ps'
 ```
 
@@ -49,6 +51,16 @@ Deploy a container:
 
 ```bash
 via deploy nginx:latest --to rig --name web --port 18080:80
+via deploy nginx:latest --to rig --name web --route hub --port 18080:80
+```
+
+Configure hub routing:
+
+```bash
+via hub use https://hub.via.pompeiilabs.com
+via invite create --name pi
+via join <token>
+via start
 ```
 
 Read and operate service logs:
@@ -92,8 +104,8 @@ formatting -> tests -> build
 Releases deploy only from version tags:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0-alpha.1
+git push origin v0.2.0-alpha.1
 ```
 
 The release workflow runs:
@@ -101,6 +113,10 @@ The release workflow runs:
 ```text
 formatting -> tests -> build binaries -> deploy release
 ```
+
+## Hub Schema
+
+Hub schema is managed with Lux migrations in `lux/migrations/`. Keep table and column names brief. The initial hub tables are `meshes`, `nodes`, `tokens`, `sessions`, `cmds`, `events`, and `audit`.
 
 ## Local Verification
 
@@ -126,10 +142,11 @@ cargo build --locked --release
 - `src/main.rs`: command handlers.
 - `src/ssh.rs`: SSH bootstrap and file transfer helpers.
 - `src/rpc.rs`: encrypted/signed node RPC.
+- `src/hub.rs`: hub server, relay client, invite tokens, and Lux schema setup.
 - `src/security.rs`: encryption/signing/key utilities.
 - `src/state.rs`: embedded Lux state.
 - `src/docker.rs`: Docker operations.
 
 ## Security Model
 
-Via currently uses a shared mesh key. A node that can read that key has mesh authority. RPC payloads are encrypted and signed, and secret values are encrypted at rest, but Via should still be operated only on trusted machines over a private network.
+Via currently uses a shared mesh key. A node that can read that key has mesh authority. RPC payloads are encrypted and signed before direct or hub transport, and secret values are encrypted at rest, but Via should still be operated only on trusted machines.

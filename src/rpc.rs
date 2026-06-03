@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
     Ping,
@@ -242,6 +242,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         }
     }
 

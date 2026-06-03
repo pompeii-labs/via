@@ -4,8 +4,10 @@ use crate::rpc::{RpcRequest, RpcResponse};
 use crate::state::ViaState;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::future::pending;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 pub async fn run(bind: String, paths: ViaPaths) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
@@ -13,13 +15,40 @@ pub async fn run(bind: String, paths: ViaPaths) -> Result<()> {
     println!("via daemon listening on {addr}");
     let mut state = ViaState::open(paths).await?;
     let paths = state.paths().clone();
+    let mut hub_rx = match (state.mesh().await, state.local_node().await) {
+        (Ok(Some(mesh)), Ok(node)) => crate::hub::spawn_agent(paths.clone(), mesh, node),
+        _ => None,
+    };
     let mut seen_nonces = HashSet::new();
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        if let Err(error) = handle_connection(&mut state, &paths, &mut seen_nonces, socket).await {
-            eprintln!("via daemon request failed: {error}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                if let Err(error) = handle_connection(&mut state, &paths, &mut seen_nonces, socket).await {
+                    eprintln!("via daemon request failed: {error}");
+                }
+            }
+            agent = recv_hub(&mut hub_rx) => {
+                match agent {
+                    Some(agent) => {
+                        let response = handle_rpc_line(&mut state, &paths, &mut seen_nonces, &agent.req).await?;
+                        let encoded = crate::rpc::encode_response(&paths, &response)?;
+                        let _ = agent.reply.send(String::from_utf8(encoded)?);
+                    }
+                    None => hub_rx = None,
+                }
+            }
         }
+    }
+}
+
+async fn recv_hub(
+    rx: &mut Option<mpsc::Receiver<crate::hub::HubAgentRpc>>,
+) -> Option<crate::hub::HubAgentRpc> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => pending().await,
     }
 }
 
@@ -32,7 +61,23 @@ async fn handle_connection(
     let mut reader = BufReader::new(socket);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    let response = match crate::rpc::verify_request(paths, &line) {
+    let response = handle_rpc_line(state, paths, seen_nonces, &line).await?;
+
+    let mut socket = reader.into_inner();
+    socket
+        .write_all(&crate::rpc::encode_response(paths, &response)?)
+        .await?;
+    socket.write_all(b"\n").await?;
+    Ok(())
+}
+
+pub async fn handle_rpc_line(
+    state: &mut ViaState,
+    paths: &ViaPaths,
+    seen_nonces: &mut HashSet<String>,
+    line: &str,
+) -> Result<RpcResponse> {
+    let response = match crate::rpc::verify_request(paths, line) {
         Ok(verified) => match verified.nonce {
             Some(nonce) => {
                 if !seen_nonces.insert(nonce) {
@@ -59,13 +104,7 @@ async fn handle_connection(
             message: error.to_string(),
         },
     };
-
-    let mut socket = reader.into_inner();
-    socket
-        .write_all(&crate::rpc::encode_response(paths, &response)?)
-        .await?;
-    socket.write_all(b"\n").await?;
-    Ok(())
+    Ok(response)
 }
 
 async fn handle_request(state: &mut ViaState, request: RpcRequest) -> Result<RpcResponse> {
@@ -152,6 +191,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = std_listener.local_addr().unwrap();
@@ -195,6 +235,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         crate::security::ensure_mesh_key(&paths).unwrap();
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

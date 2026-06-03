@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "via")]
@@ -32,6 +32,19 @@ pub enum Command {
         bind: String,
     },
     Nodes,
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
+    },
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
+    Join {
+        token: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
     Node {
         #[command(subcommand)]
         command: NodeCommand,
@@ -45,6 +58,8 @@ pub enum Command {
         name: String,
         #[arg(long)]
         port: Option<String>,
+        #[arg(long, value_enum, default_value = "auto")]
+        route: RouteMode,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -70,6 +85,8 @@ pub enum Command {
     },
     Exec {
         node: String,
+        #[arg(long, value_enum, default_value = "auto")]
+        route: RouteMode,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -103,10 +120,58 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
-    Rename { old: String, new: String },
-    Addr { node: String, address: String },
-    Ping { node: String },
-    Rm { node: String },
+    Rename {
+        old: String,
+        new: String,
+    },
+    Addr {
+        node: String,
+        address: String,
+    },
+    Ping {
+        node: String,
+        #[arg(long, value_enum, default_value = "auto")]
+        route: RouteMode,
+    },
+    Rm {
+        node: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HubCommand {
+    Use {
+        url: String,
+    },
+    Start {
+        #[arg(long, default_value = "127.0.0.1:47820")]
+        bind: String,
+        #[arg(long)]
+        lux_dir: Option<String>,
+        #[arg(long)]
+        migrate: bool,
+    },
+    Migrate {
+        #[arg(long)]
+        lux_dir: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InviteCommand {
+    Create {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = 86400)]
+        ttl: i64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RouteMode {
+    Auto,
+    Direct,
+    Hub,
 }
 
 #[derive(Debug, Subcommand)]

@@ -1,6 +1,7 @@
 mod cli;
 mod daemon;
 mod docker;
+mod hub;
 mod model;
 mod paths;
 mod rpc;
@@ -11,7 +12,7 @@ mod util;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, NodeCommand, SecretCommand};
+use cli::{Cli, Command, HubCommand, InviteCommand, NodeCommand, SecretCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,6 +21,30 @@ async fn main() -> Result<()> {
     if let Command::Daemon { bind } = &cli.command {
         daemon::run(bind.clone(), paths).await?;
         return Ok(());
+    }
+    match &cli.command {
+        Command::Hub {
+            command:
+                HubCommand::Start {
+                    bind,
+                    lux_dir,
+                    migrate,
+                },
+        } => {
+            hub::start(bind.clone(), lux_dir.clone(), *migrate).await?;
+            return Ok(());
+        }
+        Command::Hub {
+            command: HubCommand::Migrate { lux_dir },
+        } => {
+            hub::migrate(lux_dir.clone()).await?;
+            return Ok(());
+        }
+        Command::Join { token, name } => {
+            hub::join(&paths, name.clone(), token.clone()).await?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     let mut state = state::ViaState::open(paths.clone()).await?;
@@ -48,6 +73,21 @@ async fn main() -> Result<()> {
         Command::Nodes => {
             commands::nodes(&state).await?;
         }
+        Command::Hub { command } => match command {
+            HubCommand::Use { url } => {
+                hub::use_hub(&state, &paths, url).await?;
+            }
+            HubCommand::Start { .. } | HubCommand::Migrate { .. } => {
+                unreachable!("hub server commands are handled before state initialization")
+            }
+        },
+        Command::Invite { command } => match command {
+            InviteCommand::Create { name, ttl } => {
+                let token = hub::create_invite(&state, &paths, name, ttl).await?;
+                println!("{token}");
+            }
+        },
+        Command::Join { .. } => unreachable!("join is handled before state initialization"),
         Command::Node { command } => match command {
             NodeCommand::Rename { old, new } => {
                 commands::rename_node(&mut state, old, new).await?;
@@ -55,8 +95,8 @@ async fn main() -> Result<()> {
             NodeCommand::Addr { node, address } => {
                 commands::set_node_addr(&mut state, node, address).await?;
             }
-            NodeCommand::Ping { node } => {
-                commands::node_ping(&state, node).await?;
+            NodeCommand::Ping { node, route } => {
+                commands::node_ping(&state, node, route).await?;
             }
             NodeCommand::Rm { node } => {
                 commands::node_rm(&mut state, node).await?;
@@ -70,9 +110,22 @@ async fn main() -> Result<()> {
             to,
             name,
             port,
+            route,
             command,
         } => {
-            commands::deploy(&mut state, &paths, target, to, name, port, command).await?;
+            commands::deploy(
+                &mut state,
+                &paths,
+                commands::DeployArgs {
+                    target,
+                    to,
+                    name,
+                    port,
+                    route,
+                    command,
+                },
+            )
+            .await?;
         }
         Command::Services => {
             commands::services(&state).await?;
@@ -96,8 +149,12 @@ async fn main() -> Result<()> {
         Command::Rm { service } => {
             commands::rm(&mut state, service).await?;
         }
-        Command::Exec { node, command } => {
-            commands::exec(&mut state, node, command).await?;
+        Command::Exec {
+            node,
+            route,
+            command,
+        } => {
+            commands::exec(&mut state, node, route, command).await?;
         }
         Command::Open { service } => {
             commands::open(&state, service).await?;
@@ -131,7 +188,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-mod commands {
+pub(crate) mod commands {
+    use crate::cli::RouteMode;
     use crate::docker;
     use crate::model::{Mesh, Node, ServiceStatus};
     use crate::paths::ViaPaths;
@@ -402,7 +460,7 @@ mod commands {
         Ok(())
     }
 
-    pub async fn node_ping(state: &ViaState, node_slug: String) -> Result<()> {
+    pub async fn node_ping(state: &ViaState, node_slug: String, route: RouteMode) -> Result<()> {
         let node = state
             .node_by_slug(&node_slug)
             .await?
@@ -411,8 +469,8 @@ mod commands {
             println!("Node '{}' is local.", node.slug);
             return Ok(());
         }
-        crate::rpc::ping(&node.daemon_addr).await?;
-        println!("Node '{}' is reachable at {}.", node.slug, node.daemon_addr);
+        call_node(state, &node, crate::rpc::RpcRequest::Ping, route).await?;
+        println!("Node '{}' is reachable via {:?}.", node.slug, route);
         Ok(())
     }
 
@@ -436,46 +494,65 @@ mod commands {
         Ok(())
     }
 
-    pub async fn deploy(
-        state: &mut ViaState,
-        paths: &ViaPaths,
-        target: String,
-        to: String,
-        name: String,
-        port: Option<String>,
-        command: Vec<String>,
-    ) -> Result<()> {
+    pub struct DeployArgs {
+        pub target: String,
+        pub to: String,
+        pub name: String,
+        pub port: Option<String>,
+        pub route: RouteMode,
+        pub command: Vec<String>,
+    }
+
+    pub async fn deploy(state: &mut ViaState, paths: &ViaPaths, args: DeployArgs) -> Result<()> {
         let node = state
-            .node_by_slug(&to)
+            .node_by_slug(&args.to)
             .await?
-            .ok_or_else(|| anyhow!("unknown node '{to}'"))?;
-        let service_name = normalize_slug(&name)?;
+            .ok_or_else(|| anyhow!("unknown node '{}'", args.to))?;
+        let service_name = normalize_slug(&args.name)?;
         if state.service_by_name(&service_name).await?.is_some() {
             bail!("service '{service_name}' already exists");
         }
 
         let container = format!("via-{}", service_name);
-        let target_path = PathBuf::from(&target);
+        let target_path = PathBuf::from(&args.target);
         let env = decrypted_secrets(state, paths).await?;
         let mut service = if target_path.exists() {
             if node.last_seen_at.is_some() {
-                docker::deploy_path(&node, &target_path, &container, port, &env, &command).await?
+                docker::deploy_path(
+                    &node,
+                    &target_path,
+                    &container,
+                    args.port,
+                    &env,
+                    &args.command,
+                )
+                .await?
             } else {
-                bail!("remote path deploy is not supported in v0.1.0; build and push an image, then deploy the image")
+                bail!("remote path deploy over RPC is not supported; build and push an image, then deploy the image")
             }
         } else if node.last_seen_at.is_some() {
-            docker::deploy_image(&node, &target, &container, port, &env, &command).await?
+            docker::deploy_image(
+                &node,
+                &args.target,
+                &container,
+                args.port,
+                &env,
+                &args.command,
+            )
+            .await?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match call_node(
+                state,
+                &node,
                 crate::rpc::RpcRequest::DeployImage {
-                    image: target,
+                    image: args.target,
                     service: service_name.clone(),
                     container,
-                    port,
+                    port: args.port,
                     env,
-                    command,
+                    command: args.command,
                 },
+                args.route,
             )
             .await?
             {
@@ -650,7 +727,12 @@ mod commands {
         Ok(())
     }
 
-    pub async fn exec(state: &mut ViaState, node: String, command: Vec<String>) -> Result<()> {
+    pub async fn exec(
+        state: &mut ViaState,
+        node: String,
+        route: RouteMode,
+        command: Vec<String>,
+    ) -> Result<()> {
         let node = state
             .node_by_slug(&node)
             .await?
@@ -659,11 +741,13 @@ mod commands {
         let output = if local {
             crate::util::run_command_capture(&command)?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match call_node(
+                state,
+                &node,
                 crate::rpc::RpcRequest::Exec {
                     command: command.clone(),
                 },
+                route,
             )
             .await?
             {
@@ -744,7 +828,7 @@ mod commands {
         if all {
             let local_node = state.local_node().await?;
             for node in state.nodes().await? {
-                update_node(&node, node.id == local_node.id, &latest).await?;
+                update_node(state, &node, node.id == local_node.id, &latest).await?;
             }
         } else if let Some(node_slug) = node {
             let node = state
@@ -752,7 +836,7 @@ mod commands {
                 .await?
                 .ok_or_else(|| anyhow!("unknown node '{node_slug}'"))?;
             let local = state.local_node().await?.id == node.id;
-            update_node(&node, local, &latest).await?;
+            update_node(state, &node, local, &latest).await?;
         } else {
             update_local(&latest)?;
         }
@@ -785,13 +869,14 @@ mod commands {
         }
     }
 
-    async fn update_node(node: &Node, local: bool, version: &str) -> Result<()> {
+    async fn update_node(state: &ViaState, node: &Node, local: bool, version: &str) -> Result<()> {
         println!("Updating '{}' to {}...", node.slug, version);
         let output = if local {
             run_update_installer(version)?
         } else {
-            match crate::rpc::call(
-                &node.daemon_addr,
+            match call_node(
+                state,
+                node,
                 crate::rpc::RpcRequest::Exec {
                     command: vec![
                         "sh".to_string(),
@@ -799,6 +884,7 @@ mod commands {
                         update_shell_command(version),
                     ],
                 },
+                RouteMode::Auto,
             )
             .await?
             {
@@ -1004,6 +1090,30 @@ mod commands {
             }
         }
         Ok(())
+    }
+
+    async fn call_node(
+        state: &ViaState,
+        node: &Node,
+        request: crate::rpc::RpcRequest,
+        route: RouteMode,
+    ) -> Result<crate::rpc::RpcResponse> {
+        match route {
+            RouteMode::Direct => crate::rpc::call(&node.daemon_addr, request).await,
+            RouteMode::Hub => crate::hub::call_node(state, node, request).await,
+            RouteMode::Auto => match crate::rpc::call(&node.daemon_addr, request.clone()).await {
+                Ok(response) => Ok(response),
+                Err(direct_error) if crate::hub::configured(state.paths()) => {
+                    match crate::hub::call_node(state, node, request).await {
+                        Ok(response) => Ok(response),
+                        Err(hub_error) => Err(anyhow!(
+                            "direct route failed: {direct_error}; hub route failed: {hub_error}"
+                        )),
+                    }
+                }
+                Err(error) => Err(error),
+            },
+        }
     }
 
     async fn resolve_service_node_addr(

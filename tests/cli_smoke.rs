@@ -12,7 +12,10 @@ fn version_flag_reports_package_version() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("via 0.1.0"), "unexpected stdout: {stdout}");
+    assert!(
+        stdout.contains("via 0.2.0-alpha.1"),
+        "unexpected stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -22,7 +25,7 @@ fn update_check_reports_available_version() {
 
     let output = Command::new(via)
         .env("HOME", temp.path())
-        .env("VIA_UPDATE_VERSION", "0.1.1")
+        .env("VIA_UPDATE_VERSION", "0.2.1")
         .args(["update", "--check"])
         .output()
         .unwrap();
@@ -34,11 +37,11 @@ fn update_check_reports_available_version() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("current: 0.1.0"),
+        stdout.contains("current: 0.2.0-alpha.1"),
         "unexpected stdout: {stdout}"
     );
     assert!(
-        stdout.contains("latest:  0.1.1"),
+        stdout.contains("latest:  0.2.1"),
         "unexpected stdout: {stdout}"
     );
     assert!(stdout.contains("available"), "unexpected stdout: {stdout}");

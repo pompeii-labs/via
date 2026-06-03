@@ -1,0 +1,7 @@
+["TCREATE","meshes","id STR UNIQUE,","name STR,","created INT,","updated INT"]
+["TCREATE","nodes","id STR UNIQUE,","mesh STR,","name STR,","slug STR,","os STR,","arch STR,","ver STR,","seen INT,","status STR"]
+["TCREATE","tokens","id STR UNIQUE,","mesh STR,","hash STR UNIQUE,","name STR,","exp INT,","used BOOL,","created INT"]
+["TCREATE","sessions","id STR UNIQUE,","mesh STR,","node STR,","started INT,","seen INT,","addr STR"]
+["TCREATE","cmds","id STR UNIQUE,","mesh STR,","src STR,","dst STR,","state STR,","req STR,","res STR,","created INT,","updated INT,","exp INT"]
+["TCREATE","events","id STR UNIQUE,","mesh STR,","node STR,","kind STR,","data STR,","created INT"]
+["TCREATE","audit","id STR UNIQUE,","mesh STR,","actor STR,","kind STR,","data STR,","created INT"]

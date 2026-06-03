@@ -433,6 +433,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -470,6 +471,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -509,6 +511,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths.clone()).await.unwrap();
         state
@@ -538,6 +541,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -573,6 +577,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -603,6 +608,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -636,6 +642,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state
@@ -673,6 +680,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
         let mut state = ViaState::open(paths).await.unwrap();
         state

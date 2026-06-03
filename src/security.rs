@@ -67,6 +67,24 @@ pub fn read_mesh_key(paths: &ViaPaths) -> Result<Vec<u8>> {
     Ok(key)
 }
 
+pub fn install_mesh_key(paths: &ViaPaths, encoded: &str) -> Result<Vec<u8>> {
+    paths.ensure()?;
+    let key = B64.decode(encoded.trim())?;
+    if key.len() != 32 {
+        bail!("invalid Via mesh key length");
+    }
+    if paths.mesh_key.exists() {
+        harden_mesh_key_permissions(paths)?;
+        let existing = read_mesh_key(paths)?;
+        if existing != key {
+            bail!("Via mesh key already exists and does not match invite");
+        }
+        return Ok(existing);
+    }
+    write_mesh_key(paths, encoded.trim())?;
+    Ok(key)
+}
+
 pub fn mesh_key_if_present(paths: &ViaPaths) -> Result<Option<Vec<u8>>> {
     if paths.mesh_key.exists() {
         Ok(Some(read_mesh_key(paths)?))
@@ -179,6 +197,7 @@ mod tests {
             logs: temp.path().join("logs"),
             bin: temp.path().join("bin"),
             mesh_key: temp.path().join("mesh.key"),
+            hub_config: temp.path().join("hub.json"),
         };
 
         ensure_mesh_key(&paths).unwrap();
