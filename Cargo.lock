@@ -2118,6 +2118,7 @@ dependencies = [
  "hmac",
  "lux",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

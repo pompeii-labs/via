@@ -10,8 +10,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use ring::signature::{UnparsedPublicKey, ED25519};
 use futures_util::{SinkExt, StreamExt};
 use lux::{EmbeddedClient, EmbeddedValue, ServerConfig, ServerHandle};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,9 @@ use uuid::Uuid;
 
 const INIT_HUB: &str = include_str!("../lux/migrations/20260602000000_init_hub.lux");
 const ADMIN_TOKEN_ENV: &str = "VIA_HUB_ADMIN_TOKEN";
+const ISSUER_PUBKEY_ENV: &str = "VIA_HUB_ISSUER_PUBKEY";
+const HUB_URL_ENV: &str = "VIA_HUB_URL";
+const GRANT_PREFIX: &str = "viahub1.";
 const HOSTED_HUB_URL: &str = "https://hub.via.pompeiilabs.com";
 const TABLES: &[&str] = &[
     "meshes", "nodes", "tokens", "sessions", "cmds", "events", "audit",
@@ -100,6 +104,36 @@ struct RegisterNodeRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct ProvisionGrantRequest {
+    grant: String,
+    #[serde(alias = "node_id")]
+    node: String,
+    #[serde(alias = "node_slug")]
+    slug: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SignedGrantJson {
+    payload: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HubProvisionGrant {
+    v: u8,
+    aud: String,
+    exp: i64,
+    #[serde(alias = "nonce")]
+    jti: String,
+    #[serde(alias = "account_id")]
+    account: String,
+    #[serde(alias = "mesh_id")]
+    mesh: String,
+    #[serde(default, alias = "mesh_name")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct JoinRequest {
     mesh: String,
     node: String,
@@ -150,9 +184,12 @@ type SessionKey = (String, String);
 struct HubRuntime {
     db: HubDb,
     admin_token: Option<String>,
+    issuer_pubkey: Option<Vec<u8>>,
+    hub_url: Option<String>,
     sessions: Mutex<HashMap<SessionKey, mpsc::Sender<HubToAgent>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
     results: Mutex<HashMap<String, CmdResponse>>,
+    seen_grants: Mutex<HashMap<String, i64>>,
 }
 
 pub fn configured(paths: &ViaPaths) -> bool {
@@ -469,15 +506,23 @@ pub async fn start(bind: String, lux_dir: Option<String>, migrate: bool) -> Resu
         admin_token: std::env::var(ADMIN_TOKEN_ENV)
             .ok()
             .filter(|token| !token.is_empty()),
+        issuer_pubkey: load_issuer_pubkey()?,
+        hub_url: std::env::var(HUB_URL_ENV)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .map(|url| normalize_http_url(&url))
+            .transpose()?,
         sessions: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         results: Mutex::new(HashMap::new()),
+        seen_grants: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/agent/connect", get(agent_connect))
         .route("/v1/meshes", post(create_mesh))
         .route("/v1/tokens", post(create_token))
+        .route("/v1/grants/provision", post(provision_with_grant))
         .route("/v1/join", post(join_mesh))
         .route("/v1/nodes", get(list_nodes))
         .route("/v1/nodes/register", post(register_node))
@@ -543,6 +588,31 @@ async fn register_node(
     match runtime
         .db
         .register_node(&req.mesh, &req.node, &req.slug)
+        .await
+    {
+        Ok(token) => Json(AuthResponse { token }).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn provision_with_grant(
+    State(runtime): State<Arc<HubRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ProvisionGrantRequest>,
+) -> impl IntoResponse {
+    let grant = match verify_grant(&runtime, &headers, &req.grant).await {
+        Ok(grant) => grant,
+        Err(error) => return (StatusCode::UNAUTHORIZED, error.to_string()).into_response(),
+    };
+    match runtime
+        .db
+        .provision_grant_mesh(
+            &grant.mesh,
+            grant.name.as_deref(),
+            &grant.account,
+            &req.node,
+            &req.slug,
+        )
         .await
     {
         Ok(token) => Json(AuthResponse { token }).into_response(),
@@ -848,6 +918,131 @@ fn admin_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
+fn load_issuer_pubkey() -> Result<Option<Vec<u8>>> {
+    let Some(raw) = std::env::var(ISSUER_PUBKEY_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let bytes = decode_base64(&raw).context("invalid issuer public key")?;
+    if bytes.len() != 32 {
+        bail!("issuer public key must be 32 bytes");
+    }
+    Ok(Some(bytes))
+}
+
+async fn verify_grant(
+    runtime: &HubRuntime,
+    headers: &HeaderMap,
+    grant: &str,
+) -> Result<HubProvisionGrant> {
+    let issuer_pubkey = runtime
+        .issuer_pubkey
+        .as_ref()
+        .ok_or_else(|| anyhow!("grant provisioning is not configured"))?;
+    let (payload, signature) = decode_signed_grant(grant)?;
+    UnparsedPublicKey::new(&ED25519, issuer_pubkey)
+        .verify(&payload, &signature)
+        .map_err(|_| anyhow!("invalid grant signature"))?;
+    let claims: HubProvisionGrant = serde_json::from_slice(&payload)?;
+    if claims.v != 1 {
+        bail!("unsupported grant version");
+    }
+    if claims.exp < now_ts() {
+        bail!("grant expired");
+    }
+    if claims.jti.trim().is_empty() {
+        bail!("grant missing jti");
+    }
+    if claims.account.trim().is_empty() {
+        bail!("grant missing account");
+    }
+    if claims.mesh.trim().is_empty() {
+        bail!("grant missing mesh");
+    }
+    let expected_audience = grant_audience(runtime, headers)?;
+    if normalize_http_url(&claims.aud)? != expected_audience {
+        bail!("grant audience mismatch");
+    }
+    let mut seen = runtime.seen_grants.lock().await;
+    let now = now_ts();
+    seen.retain(|_, exp| *exp >= now);
+    if seen.contains_key(&claims.jti) {
+        bail!("grant replayed");
+    }
+    seen.insert(claims.jti.clone(), claims.exp);
+    Ok(claims)
+}
+
+fn decode_signed_grant(grant: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(raw) = grant.strip_prefix(GRANT_PREFIX) {
+        let mut parts = raw.split('.');
+        let payload = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing payload"))?;
+        let signature = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing signature"))?;
+        if parts.next().is_some() {
+            bail!("invalid grant format");
+        }
+        return signed_grant_parts(payload, signature);
+    }
+    if grant.contains('.') {
+        let mut parts = grant.split('.');
+        let payload = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing payload"))?;
+        let signature = parts
+            .next()
+            .ok_or_else(|| anyhow!("grant missing signature"))?;
+        if parts.next().is_some() {
+            bail!("invalid grant format");
+        }
+        return signed_grant_parts(payload, signature);
+    }
+    let grant: SignedGrantJson = serde_json::from_str(grant)?;
+    signed_grant_parts(&grant.payload, &grant.signature)
+}
+
+fn signed_grant_parts(payload: &str, signature: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    let payload = URL_SAFE_NO_PAD.decode(payload)?;
+    let signature = decode_base64(signature)?;
+    if signature.len() != 64 {
+        bail!("grant signature must be 64 bytes");
+    }
+    Ok((payload, signature))
+}
+
+fn decode_base64(raw: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| URL_SAFE.decode(raw))
+        .or_else(|_| STANDARD.decode(raw))
+        .map_err(|error| error.into())
+}
+
+fn grant_audience(runtime: &HubRuntime, headers: &HeaderMap) -> Result<String> {
+    if let Some(url) = runtime.hub_url.as_deref() {
+        return Ok(url.to_string());
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .ok_or_else(|| anyhow!("missing host header"))?
+        .to_str()
+        .context("invalid host header")?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http")
+        .split(',')
+        .next()
+        .unwrap_or("http")
+        .trim();
+    normalize_http_url(&format!("{scheme}://{host}"))
+}
+
 fn require_admin(runtime: &HubRuntime, headers: &HeaderMap) -> Result<()> {
     let Some(expected) = runtime.admin_token.as_deref() else {
         return Ok(());
@@ -976,6 +1171,29 @@ impl HubDb {
     async fn register_node(&self, mesh: &str, node: &str, slug: &str) -> Result<String> {
         self.insert_node_record(mesh, node, slug).await?;
         self.create_node_token(mesh, slug).await
+    }
+
+    async fn provision_grant_mesh(
+        &self,
+        mesh: &str,
+        name: Option<&str>,
+        account: &str,
+        node: &str,
+        slug: &str,
+    ) -> Result<String> {
+        self.insert_mesh(mesh, name.unwrap_or("default")).await?;
+        self.record_mesh_account(mesh, account).await?;
+        self.register_node(mesh, node, slug).await
+    }
+
+    async fn record_mesh_account(&self, mesh: &str, account: &str) -> Result<()> {
+        self.client
+            .execute(
+                "TUPDATE",
+                &["meshes", "SET", "account", account, "WHERE", "id", "=", mesh],
+            )
+            .await?;
+        self.persist().await
     }
 
     async fn claim_invite(
@@ -1255,8 +1473,8 @@ mod tests {
     use super::{
         call_node, decode_invite, hash_token, normalize_hub_ref, parse_migration, save_config,
         start, AuthResponse, CreateMeshRequest, CreateTokenRequest, HubConfig, InviteToken,
-        JoinRequest, PostCmdRequest, RegisterNodeRequest, ADMIN_TOKEN_ENV, HOSTED_HUB_URL,
-        INIT_HUB, TABLES,
+        JoinRequest, PostCmdRequest, RegisterNodeRequest, ADMIN_TOKEN_ENV, GRANT_PREFIX,
+        HOSTED_HUB_URL, HUB_URL_ENV, INIT_HUB, ISSUER_PUBKEY_ENV, TABLES,
     };
     use crate::model::{Mesh, Node};
     use crate::paths::ViaPaths;
@@ -1264,6 +1482,7 @@ mod tests {
     use crate::state::ViaState;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
@@ -1326,7 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn hub_relay_exec_round_trips_without_plaintext_in_hub_store() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let source_temp = TempDir::new().unwrap();
         let target_temp = TempDir::new().unwrap();
         let hub_temp = TempDir::new().unwrap();
@@ -1474,7 +1693,7 @@ mod tests {
     #[tokio::test]
     async fn hub_rejects_commands_without_valid_node_token() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
@@ -1518,7 +1737,7 @@ mod tests {
     #[tokio::test]
     async fn invite_tokens_are_single_use() {
         let _guard = env_lock().lock().await;
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
@@ -1582,12 +1801,137 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_admin_endpoints_require_admin_token_when_configured() {
+    async fn valid_grant_provisions_mesh_and_node_token() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let client = reqwest::Client::new();
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-valid",
+            "mesh-grant",
+        );
+
+        let auth = client
+            .post(format!("{}/v1/grants/provision", hub.url))
+            .json(&serde_json::json!({
+                "grant": grant,
+                "node": "node-1",
+                "slug": "rig"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<AuthResponse>()
+            .await
+            .unwrap();
+        let nodes = client
+            .get(format!("{}/v1/nodes", hub.url))
+            .query(&[
+                ("mesh", "mesh-grant"),
+                ("node", "rig"),
+                ("token", auth.token.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(nodes.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() - 1,
+            "jti-expired",
+            "mesh-expired",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bad_signature_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let other_key = test_key_pair(8);
+        let grant = signed_grant(
+            &other_key,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-bad-sig",
+            "mesh-bad-sig",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_grant_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            "https://wrong-hub.example",
+            crate::util::now_ts() + 60,
+            "jti-wrong-aud",
+            "mesh-wrong-aud",
+        );
+        let response = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn replayed_grant_jti_is_rejected() {
+        let _guard = env_lock().lock().await;
+        clear_hub_env();
+        let hub = GrantHub::start().await;
+        let grant = signed_grant(
+            &hub.key_pair,
+            &hub.url,
+            crate::util::now_ts() + 60,
+            "jti-replay",
+            "mesh-replay",
+        );
+        let first = post_grant(&hub.url, grant.clone()).await;
+        let second = post_grant(&hub.url, grant).await;
+
+        hub.task.abort();
+        clear_hub_env();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+        assert_eq!(second.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn no_issuer_pubkey_preserves_admin_token_flow() {
         let _guard = env_lock().lock().await;
         let hub_temp = TempDir::new().unwrap();
         let hub_addr = free_addr();
         let hub_url = format!("http://{hub_addr}");
         let hub_lux = hub_temp.path().join("lux");
+        clear_hub_env();
         std::env::set_var(ADMIN_TOKEN_ENV, "admin-secret");
         let hub_task = tokio::spawn(start(
             hub_addr,
@@ -1618,9 +1962,89 @@ mod tests {
             .unwrap();
 
         hub_task.abort();
-        std::env::remove_var(ADMIN_TOKEN_ENV);
+        clear_hub_env();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
         assert_eq!(auth.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    struct GrantHub {
+        url: String,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        key_pair: Ed25519KeyPair,
+        _temp: TempDir,
+    }
+
+    impl GrantHub {
+        async fn start() -> Self {
+            let key_pair = test_key_pair(7);
+            let public_key = URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref());
+            let hub_temp = TempDir::new().unwrap();
+            let hub_addr = free_addr();
+            let hub_url = format!("http://{hub_addr}");
+            let hub_lux = hub_temp.path().join("lux");
+            std::env::set_var(ISSUER_PUBKEY_ENV, public_key);
+            std::env::set_var(HUB_URL_ENV, &hub_url);
+            let task = tokio::spawn(start(
+                hub_addr,
+                Some(hub_lux.to_string_lossy().to_string()),
+                true,
+            ));
+            wait_for_health(&hub_url).await;
+            Self {
+                url: hub_url,
+                task,
+                key_pair,
+                _temp: hub_temp,
+            }
+        }
+    }
+
+    async fn post_grant(hub_url: &str, grant: String) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{hub_url}/v1/grants/provision"))
+            .json(&serde_json::json!({
+                "grant": grant,
+                "node": "node-1",
+                "slug": "rig"
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn signed_grant(
+        key_pair: &Ed25519KeyPair,
+        audience: &str,
+        exp: i64,
+        jti: &str,
+        mesh: &str,
+    ) -> String {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "aud": audience,
+            "exp": exp,
+            "jti": jti,
+            "account_id": "acct_123",
+            "mesh_id": mesh,
+            "mesh_name": "default"
+        }))
+        .unwrap();
+        let signature = key_pair.sign(&payload);
+        format!(
+            "{GRANT_PREFIX}{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        )
+    }
+
+    fn test_key_pair(seed_byte: u8) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(&[seed_byte; 32]).unwrap()
+    }
+
+    fn clear_hub_env() {
+        std::env::remove_var(ADMIN_TOKEN_ENV);
+        std::env::remove_var(ISSUER_PUBKEY_ENV);
+        std::env::remove_var(HUB_URL_ENV);
     }
 
     fn env_lock() -> &'static TokioMutex<()> {
